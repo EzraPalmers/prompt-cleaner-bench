@@ -126,16 +126,6 @@ def test_binary_skipped(tool, repo):
     assert run(tool, repo).returncode == 0
 
 
-def test_message(tool, repo, tmp_path):
-    msg = tmp_path / "MSG"
-    msg.write_text("feat: add thing\n# Zorblax in a git comment line\n", encoding="utf-8")
-    assert run(tool, repo, "--message", str(msg)).returncode == 0
-    msg.write_text("feat: support zorblax\n", encoding="utf-8")
-    r = run(tool, repo, "--message", str(msg))
-    assert r.returncode == 1
-    assert "FAIL commit message: private term" in r.stderr
-
-
 def test_nested_repo_checks_own_index(tool, repo):
     stage(repo, "a.txt", "Zorblax")
     nested = repo / "inner"

@@ -155,19 +155,6 @@ def test_no_matching_session_fails(env):
         extract(sessions.parent / "missing", CFG, data)
 
 
-def test_legacy_ids_mapped_by_content(env, tmp_path):
-    sessions, data = env
-    legacy = tmp_path / "legacy"
-    (legacy / "raw").mkdir(parents=True)
-    (legacy / "baseline").mkdir()
-    (legacy / "raw" / "07_x.txt").write_text("um water the plants on friday", encoding="utf-8", newline="")
-    (legacy / "baseline" / "07_x.txt").write_text("Water the plants on Friday.\n", encoding="utf-8", newline="")
-    extract(sessions, CFG, data, legacy)
-    rows = manifest(data)
-    assert rows["20260304T102030-03"]["legacy_id"] == 7
-    assert rows["20260304T102030-01"]["legacy_id"] is None
-
-
 def test_config_fails_fast(tmp_path):
     with pytest.raises(ConfigError, match="not found"):
         load_config(tmp_path / "bench.toml")

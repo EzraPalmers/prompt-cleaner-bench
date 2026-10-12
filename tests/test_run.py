@@ -101,7 +101,7 @@ def fake(tmp_path, monkeypatch, script):
 
 
 def args(**kw):
-    base = {"set": "dev", "model": "m-1", "effort": "low", "repeats": None, "prompt": "HEAD", "dictionary": False,
+    base = {"set": "dev", "model": "m-1", "effort": "low", "prompt": "HEAD", "dictionary": False,
             "timeout": 30.0}  # fmt: skip
     return argparse.Namespace(**{**base, **kw})
 
@@ -139,12 +139,12 @@ def test_run_records_skip_and_refuse(root, tmp_path, monkeypatch, capsys):
 
     run_dir = next((root / "data" / "runs").iterdir())
     assert run_dir.name.endswith("_m-1_low_dev_off")
-    listed = json.loads((run_dir / "c-list.1.json").read_text())
+    listed = json.loads((run_dir / "c-list.json").read_text())
     assert all(k in listed for k in RECORD_FIELDS)
     assert listed["outcome"] == "suspect-then-clean" and listed["output"] == "Cleaned words."
     assert listed["replies"] == ["1. pie chart"] and listed["unmatched"] == ["blue moose"]
     assert listed["input_tokens"] == 250 and listed["turn_usage"][1]["input_tokens"] == 150
-    clean = json.loads((run_dir / "c-clean.1.json").read_text())
+    clean = json.loads((run_dir / "c-clean.json").read_text())
     assert clean["outcome"] == "clean" and clean["input_tokens"] is None and clean["codex_version"] == "9.9.9"
     calls = json.loads(state.read_text())
     assert calls["argv"][1][-3:] == ["resume", "t-1", "-"] and "--ephemeral" not in calls["argv"][0]
@@ -153,20 +153,21 @@ def test_run_records_skip_and_refuse(root, tmp_path, monkeypatch, capsys):
     show = ["git", "-C", str(root / "cleaner"), "show", "HEAD:AGENTS.md"]
     committed = subprocess.run(show, check=True, capture_output=True)
     assert (stage / "AGENTS.md").read_bytes() == committed.stdout and (stage / ".git").is_dir()
-    assert "unmatched c-list.1: blue moose" in capsys.readouterr().out
+    assert "unmatched c-list: blue moose" in capsys.readouterr().out
 
     assert run(args(), root, codex) == 0
     assert json.loads(state.read_text())["done"] == 3
 
-    with pytest.raises(RunError, match=r"repeats \(1 -> 2\)"):
-        run(args(repeats=2), root, codex)
+    (root / "data" / "cases" / "c-clean" / "transcript.txt").write_text("changed")
+    with pytest.raises(RunError, match=r"set_version \("):
+        run(args(), root, codex)
 
 
 def test_failed_call_is_rerun(root, tmp_path, monkeypatch):
     (root / "data" / "sets" / "dev.txt").write_text("c-clean\n")
     _, codex = fake(tmp_path, monkeypatch, [{"events": [], "exit": 3}, {"events": turn(CLEAN, usage(5))}])
     assert run(args(), root, codex) == 1
-    record = json.loads(next((root / "data" / "runs").glob("*/c-clean.1.json")).read_text())
+    record = json.loads(next((root / "data" / "runs").glob("*/c-clean.json")).read_text())
     assert record["outcome"] == "failed" and record["error"].startswith("exit 3")
     assert run(args(), root, codex) == 0
 
@@ -184,7 +185,7 @@ def test_fourth_list_is_other_and_counts_its_phrases(root, tmp_path, monkeypatch
     script = [{"events": turn(first, usage(10 * n))} for n in (1, 2, 3)] + [{"events": turn(LIST, usage(40))}]
     _, codex = fake(tmp_path, monkeypatch, script)
     assert run(args(), root, codex) == 0
-    record = json.loads(next((root / "data" / "runs").glob("*/c-list.1.json")).read_text())
+    record = json.loads(next((root / "data" / "runs").glob("*/c-list.json")).read_text())
     assert record["outcome"] == "other" and len(record["replies"]) == 3 and record["unmatched"] == ["blue moose"]
 
 
@@ -196,7 +197,7 @@ def test_list_with_prose_is_other_and_not_answered(root, tmp_path, monkeypatch):
     (root / "data" / "sets" / "dev.txt").write_text("c-list\n")
     state, codex = fake(tmp_path, monkeypatch, [{"events": turn(prose, usage(10))}])
     assert run(args(), root, codex) == 0
-    record = json.loads(next((root / "data" / "runs").glob("*/c-list.1.json")).read_text())
+    record = json.loads(next((root / "data" / "runs").glob("*/c-list.json")).read_text())
     assert record["outcome"] == "other" and record["unmatched"] == [] and record["replies"] == []
     assert json.loads(state.read_text())["done"] == 1
 

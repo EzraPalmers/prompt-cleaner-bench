@@ -58,6 +58,7 @@ Run everything from this repository's root.
    ```
 
 3. Run the cleaner over a case set and judge the outputs (coming: `src/run.py`, `src/judge.py` and the `bench` skill).
+   The sets are quick (10 cases) and full (30), with one output per case and no repeats.
 4. Read the scores in `outputs/results.md` (coming), one row per prompt version, model, effort level and dictionary
    state.
 5. Mine a dictionary: in Claude Code at this root, ask for the `mine` skill. It reads your correction exchanges, finds
@@ -67,6 +68,6 @@ Run everything from this repository's root.
 
 Anything holding your words stays on your machine. `data/` (cases, runs, judge replies, mining state) and `bench.toml`
 are ignored by this repository, and `dictionary.md` by the cleaner's. What is tracked is the method, the code and
-aggregate scores. Both repositories install a guard, `src/check.py`, as a git hook; it checks staged files and commit
-messages against your own list of private terms in `data/private-terms.txt`, one per line. Hooks are not copied by a clone, so install them yourself: the exact hook
-lines are in `CLAUDE.md`.
+aggregate scores. Nothing from a dictation, correction or dictionary goes into a tracked file, examples are invented,
+and `uv run python src/check.py --all` is a one-off scan to run before a repository gets a remote; it checks every
+tracked file against your own list of private terms in `data/private-terms.txt`, one per line.

@@ -10,7 +10,7 @@ needs it.
 bench.example.toml       template of the ignored bench.toml
 src/config.py            load_config(): reads bench.toml
 src/extract.py           Codex logs -> data/cases/ and data/manifest.jsonl
-src/check.py             public-content guard, run by both repositories' hooks
+src/check.py             public-content scan of either repository's index
 src/run.py               coming: runs the cleaner over a case set
 src/judge.py             coming: judge batches, scoring, regenerates outputs/results.md
 tests/                   synthetic fixtures only
@@ -23,7 +23,7 @@ data/                    ignored; everything private
 ```
 
 Load the `bench` skill to extract, run, judge or add a results row, and the `mine` skill for resolutions, mining and
-the dictionary.
+the dictionary. The case sets are quick (10 cases) and full (30), one output per case, no repeats.
 
 ## Warnings
 
@@ -34,14 +34,7 @@ the dictionary.
   reworded.
 - Public and private split on one rule: anything holding a transcript, a correction, a dictionary term or a personal
   path lives under `data/` or in the cleaner's ignored `dictionary.md`. Method, code and aggregate scores are tracked.
-
-## Hooks
-
-Hooks are not versioned; a cloner installs them. They run the guard:
-
-- tool `.git/hooks/pre-commit`: `uv run python src/check.py`
-- tool `.git/hooks/commit-msg`: `uv run python src/check.py --message "$1"`
-- cleaner `.git/hooks/pre-commit`: `uv run --project .. python ../src/check.py`
-- cleaner `.git/hooks/commit-msg`: `uv run --project .. python ../src/check.py --message "$1"`
+- Nothing from a dictation, correction or dictionary goes into a tracked file, examples are invented, and
+  `uv run python src/check.py --all` is a one-off scan to run before a repository gets a remote.
 
 Python runs with uv.

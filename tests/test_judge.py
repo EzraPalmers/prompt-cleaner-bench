@@ -34,16 +34,16 @@ def reply(n_source: int, n_output: int) -> dict:
     }  # fmt: skip
 
 
-def answer_all(run: Run, edit=lambda call, r: r) -> None:
+def answer_all(run: Run, edit=lambda case, r: r) -> None:
     key = json.loads((run.judge_dir / "key.json").read_text())
     for n, item in key["items"].items():
-        _, source, output = judge.item_parts(run, item["call"])
+        _, source, output = judge.item_parts(run, item["case"])
         path = judge.reply_dir(run, key) / f"{n}.json"
-        path.write_text(json.dumps(edit(item["call"], reply(len(source), len(output)))), encoding="utf-8")
+        path.write_text(json.dumps(edit(item["case"], reply(len(source), len(output)))), encoding="utf-8")
 
 
 def edit_record(data: Path, case: str, **fields) -> None:
-    path = data / "runs" / RUN_ID / f"{case}.1.json"
+    path = data / "runs" / RUN_ID / f"{case}.json"
     record = json.loads(path.read_text())
     record.update(fields)
     path.write_text(json.dumps(record))
@@ -145,30 +145,18 @@ def test_item_over_token_ceiling_is_refused(data, monkeypatch):
 
 def test_missing_failed_record_blocks_the_run(data):
     run_dir = data / "runs" / RUN_ID
-    (run_dir / f"{CASES[3]}.1.json").unlink()
-    with pytest.raises(JudgeError, match=f"{CASES[3]}.1.json: missing"):
+    (run_dir / f"{CASES[3]}.json").unlink()
+    with pytest.raises(JudgeError, match=f"{CASES[3]}.json: missing"):
         Run(data, RUN_ID)
-    record = json.loads((run_dir / f"{CASES[2]}.1.json").read_text())
+    record = json.loads((run_dir / f"{CASES[2]}.json").read_text())
     record["outcome"] = "failed"
-    (run_dir / f"{CASES[3]}.1.json").write_text(json.dumps(record))
+    (run_dir / f"{CASES[3]}.json").write_text(json.dumps(record))
     with pytest.raises(JudgeError, match="outcome failed"):
         Run(data, RUN_ID)
 
 
-def test_records_must_match_the_schedule_exactly(data):
-    run_dir = data / "runs" / RUN_ID
-    shutil.copy(run_dir / f"{CASES[0]}.1.json", run_dir / f"{CASES[0]}.2.json")
-    with pytest.raises(JudgeError, match=r"\.2\.json: not scheduled"):
-        Run(data, RUN_ID)
-    spec = json.loads((run_dir / "spec.json").read_text())
-    (run_dir / "spec.json").write_text(json.dumps(spec | {"repeats": 2}))
-    (run_dir / f"{CASES[0]}.1.json").rename(run_dir / f"{CASES[0]}.3.json")
-    with pytest.raises(JudgeError, match=rf"{CASES[0]}\.1\.json: missing"):
-        Run(data, RUN_ID)
-
-
 def test_record_without_required_fields_blocks_the_run(data):
-    path = data / "runs" / RUN_ID / f"{CASES[0]}.1.json"
+    path = data / "runs" / RUN_ID / f"{CASES[0]}.json"
     record = json.loads(path.read_text())
     del record["output"]
     path.write_text(json.dumps(record))
@@ -185,7 +173,7 @@ def test_set_changed_since_the_run_is_refused(data):
 def test_inputs_or_judge_changed_since_prepare_are_refused(data, monkeypatch):
     run = Run(data, RUN_ID)
     judge.prepare(run)
-    original = run.records[f"{CASES[1]}.1"]["output"]
+    original = run.records[CASES[1]]["output"]
     edit_record(data, CASES[1], output="Paint it red. Then paint it blue.")
     run = Run(data, RUN_ID)
     answer_all(run)
@@ -218,6 +206,12 @@ def test_missing_reply_is_listed_then_scored_and_row_replaced(data):
     table = judge.RESULTS.read_text(encoding="utf-8")
     assert table.count("| a1b2c3d |") == 1
     assert "20990101" not in table
+    header = "| " + " | ".join(judge.COLUMNS) + " |"
+    assert header.startswith("| prompt | model | effort | dictionary | set | n | kept % (SE) | critical faults")
+    assert header.endswith("| tokens /call | cost /call (USD) | seconds /call | judge | harness |")
+    row = next(line for line in table.splitlines() if line.startswith("| a1b2c3d |")).split(" | ")
+    assert len(row) == len(judge.COLUMNS)
+    assert row[6:9] == ["100.0 (0.0)", "0.0", "0.0"] and row[12:14] == ["100.0", "n/a"]
 
 
 def test_retries_are_bounded_like_batches(data, monkeypatch):
@@ -236,8 +230,8 @@ def test_other_call_scores_as_all_absent_and_incomplete(data):
     judge.prepare(run)
     assert len(json.loads((run.judge_dir / "key.json").read_text())["items"]) == 3
 
-    def drop_first(call, r):
-        if call.startswith(CASES[1]):
+    def drop_first(case, r):
+        if case == CASES[1]:
             r["source"][0].update(present="no", missing=["a clause"])
         return r
 
@@ -246,9 +240,29 @@ def test_other_call_scores_as_all_absent_and_incomplete(data):
     # four cases: other (kept 0, omissions 100), one omission in eight, two perfect
     assert m["kept"][0] == pytest.approx((0 + 87.5 + 100 + 100) / 4)
     assert m["omissions"][0] == pytest.approx((100 + 12.5) / 4)
+    assert m["critical"][0] == pytest.approx((100 + 12.5) / 4)
     assert m["incomplete"][0] == 25.0
     assert m["critical_free"][0] == 50.0
-    assert m["additions"][0] == 0.0  # the other call is excluded, not counted as zero-fault
+    assert m["additions"][0] == 0.0  # the other case is excluded, not counted as zero-fault
+
+
+def test_scores_file_has_one_line_per_case_replaced_on_rerun(data):
+    scores = data / "scores.jsonl"
+    scores.write_text(json.dumps({"run_id": "other-run", "case_id": "x"}) + "\n", encoding="utf-8")
+    run = Run(data, RUN_ID)
+    judge.prepare(run)
+    answer_all(run, lambda case, r: r["source"][0].update(present="no", missing=["a clause"]) or r)
+    judge.score(run, NONE)
+    judge.score(run, NONE)
+    lines = [json.loads(ln) for ln in scores.read_text(encoding="utf-8").splitlines()]
+    assert [ln["run_id"] for ln in lines] == ["other-run"] + [RUN_ID] * 4
+    row = lines[1]
+    assert row == {
+        "run_id": RUN_ID, "prompt": "a1b2c3d", "model": "gpt-6-luna", "effort": "high", "set": "quick",
+        "dictionary": "off", "case_id": row["case_id"], "outcome": row["outcome"], "kept": row["kept"],
+        "omissions": 1, "distortions": 0, "additions": 0, "fillers": row["fillers"], "critical": 1,
+    }  # fmt: skip
+    assert row["kept"] < 100 and isinstance(row["fillers"], int)
 
 
 def test_score_prints_per_case_deltas_against_the_comparison_row(data, capsys):
@@ -266,59 +280,6 @@ def test_score_prints_per_case_deltas_against_the_comparison_row(data, capsys):
     out = capsys.readouterr().out
     assert "delta kept 6.2 (6.2) vs 0000000" in out
     assert f"  {CASES[0]}  +25.0" in out and f"  {CASES[1]}  +0.0" in out
-
-
-CLEAN = (
-    "I want to rework how the export page loads because it takes ages on big projects. I think the slow part is "
-    "probably the thumbnail step. Could you check whether the thumbnails are generated on every request? I'll write "
-    "the benchmark script tonight and you can review it tomorrow morning before the standup. We could cache the "
-    "thumbnails on disk, or we could just generate them once at upload time. Maybe the cache should expire after a "
-    "week, but I'm not sure that's long enough. The thing I care about most is that large exports stop timing out. "
-    "Let's keep the old export path around until the new one has been tested."
-)
-
-
-def test_calibration_batches_apart_then_reports_rates_kappa_and_footer(data, capsys):
-    hardened = CLEAN.replace("I think the slow part is probably", "The slow part is")
-    hedge = {"check": "hedges", "defect": "hedge removed", "source_ids": [2], "output_ids": [2]}
-    none = {"source_ids": [], "output_ids": []}
-    items = [
-        {"id": "o", "case": CASES[0], "kind": "original", "negatives": True, "output": CLEAN, "labels": [],
-         "exclude": none},
-        {"id": "p", "case": CASES[0], "kind": "perturbed", "negatives": True, "output": hardened, "labels": [hedge],
-         "exclude": none},
-        {"id": "q", "case": CASES[1], "kind": "original", "negatives": True, "output": CLEAN, "labels": [],
-         "exclude": {"source_ids": [6], "output_ids": [6]}},
-    ]  # fmt: skip
-    (data / "calibration").mkdir()
-    (data / "calibration" / "items.json").write_text(json.dumps({"items": items}), encoding="utf-8")
-    assert judge.calibrate(data, NONE) == 0
-    for j in (1, 2):
-        batches = sorted((data / "calibration" / f"judging-{j}").glob("batch-*.md"))
-        assert len(batches) == 2  # o and p share a case, so they never share a batch
-
-    def answer(j: int, flags: dict[str, list[int]]) -> None:
-        key = json.loads((data / "calibration" / f"judging-{j}" / "key.json").read_text())
-        for n, entry in key["items"].items():
-            r = reply(8, 8)
-            for s in flags.get(entry["item"], []):
-                r["source"][s - 1]["hedges"] = "no"
-            (data / "calibration" / "replies" / key["token"] / f"{n}.json").write_text(json.dumps(r))
-
-    answer(1, {"p": [2], "q": [6]})
-    with pytest.raises(JudgeError, match="3 replies missing"):
-        judge.calibrate(data, NONE)
-    answer(2, {"p": [2], "o": [6], "q": [6]})
-    judge.calibrate(data, NONE)
-    hedges = json.loads((data / "calibration" / "report.json").read_text())["checks"]["hedges"]
-    # p's S2 is labelled and q's S6 excluded, so 8 + 7 + 7 untouched units; o's S6 is a false flag in judging 2 only
-    assert hedges["detected"] == [1.0, 1.0] and hedges["untouched"] == 22
-    assert hedges["clean"] == [1.0, pytest.approx(21 / 22)]
-    assert hedges["kappa"] == pytest.approx(7 / 9) and hedges["pass"] is True
-    table = judge.RESULTS.read_text(encoding="utf-8")
-    assert "## Judge calibration" in table and "| hedges | 1 | 1.00, 1.00 | 22 | 1.00, 0.95 | 0.78 | pass |" in table
-    assert "2099" not in table and "thumbnail" not in table
-    assert "gate failed by" in capsys.readouterr().out
 
 
 def test_paired_delta():

@@ -3,9 +3,8 @@
 Checks the git repository of the current working directory against the tool's data/,
 found next to this script.
 
-    uv run python src/check.py                  staged files (pre-commit hook)
-    uv run python src/check.py --all            every file in the index
-    uv run python src/check.py --message PATH   a commit message (commit-msg hook)
+    uv run python src/check.py          staged files
+    uv run python src/check.py --all    every file in the index
 
 From cleaner/: uv run --project .. python ../src/check.py [same flags].
 Exit 0 on pass (warnings allowed), 1 on any FAIL or missing input.
@@ -117,9 +116,7 @@ def check_text(name: str, text: str, terms, case_seqs: set[str], fails: list[str
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Block private text from the public repositories.")
-    mode = ap.add_mutually_exclusive_group()
-    mode.add_argument("--all", action="store_true", help="check every file in the index, not only staged changes")
-    mode.add_argument("--message", type=Path, metavar="PATH", help="check a commit message file")
+    ap.add_argument("--all", action="store_true", help="check every file in the index, not only staged changes")
     args = ap.parse_args()
 
     start = time.perf_counter()
@@ -128,26 +125,20 @@ def main() -> int:
     try:
         terms = load_terms(DATA / "private-terms.txt")
         case_seqs = load_case_sequences(DATA / "cases")
-        if args.message:
-            lines = args.message.read_text(encoding="utf-8", errors="replace").splitlines()
-            check_text("commit message", "\n".join(ln for ln in lines if not ln.startswith("#")), terms, case_seqs,
-                       fails, warns)
-            n = 1
-        else:
-            root = Path(git(Path.cwd(), "rev-parse", "--show-toplevel").decode().strip())
-            paths = index_paths(root, staged_only=not args.all)
-            if paths:
-                ignored = git(root, "check-ignore", "--no-index", "-z", "--stdin", ok=(0, 1),
-                              stdin="\0".join(paths).encode() + b"\0")
-                fails += [f"FAIL {p}: ignored path staged" for p in ignored.decode().split("\0") if p]
-            blobs = read_blobs(root, paths)
-            for p in paths:
-                check_text(f"{p} (path)", p, terms, set(), fails, [])
-                blob = blobs.get(p)
-                if blob is None or b"\0" in blob[:8000]:
-                    continue
-                check_text(p, blob.decode("utf-8", errors="replace"), terms, case_seqs, fails, warns)
-            n = len(paths)
+        root = Path(git(Path.cwd(), "rev-parse", "--show-toplevel").decode().strip())
+        paths = index_paths(root, staged_only=not args.all)
+        if paths:
+            ignored = git(root, "check-ignore", "--no-index", "-z", "--stdin", ok=(0, 1),
+                          stdin="\0".join(paths).encode() + b"\0")
+            fails += [f"FAIL {p}: ignored path staged" for p in ignored.decode().split("\0") if p]
+        blobs = read_blobs(root, paths)
+        for p in paths:
+            check_text(f"{p} (path)", p, terms, set(), fails, [])
+            blob = blobs.get(p)
+            if blob is None or b"\0" in blob[:8000]:
+                continue
+            check_text(p, blob.decode("utf-8", errors="replace"), terms, case_seqs, fails, warns)
+        n = len(paths)
     except (InputError, OSError) as e:
         print(f"FAIL check.py: {e}", file=sys.stderr)
         return 1

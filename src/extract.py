@@ -5,9 +5,6 @@ Usage:
         Read every rollout under $CODEX_HOME/sessions (default ~/.codex/sessions) whose cwd is listed in
         bench.toml, add new cases, and mark cases whose rollout is gone as missing_log. Existing case files
         are never rewritten or deleted; a case whose extracted text differs from disk is an error.
-    uv run python src/extract.py --legacy data/legacy/tests
-        Also match cases by content against the old raw/ and baseline/ files and record each old number
-        as legacy_id in the manifest. Fails if any old case has no match.
 """
 
 import argparse
@@ -147,7 +144,6 @@ def record(case_id: str, rollout: str, cwd: str, ep: Episode) -> dict:
         "outcome": outcome,
         "suspect_rounds": ep.suspect_rounds,
         "has_feedback": bool(ep.feedback),
-        "legacy_id": None,
         "missing_log": False,
     }
 
@@ -174,34 +170,12 @@ def check_case(case_dir: Path, files: dict[str, str | None]) -> None:
             raise ExtractError(f"{case_dir.name}/{name}: extracted text differs from the file on disk")
 
 
-def map_legacy(manifest: dict[str, dict], content: dict[str, tuple[str, str | None]], legacy: Path) -> int:
-    by_content: dict[tuple[str, str | None], list[str]] = {}
-    for cid, key in content.items():
-        by_content.setdefault(key, []).append(cid)
-    raws = sorted((legacy / "raw").glob("*.txt"))
-    if not raws:
-        raise ExtractError(f"no legacy raw files under {legacy}")
-    for raw in raws:
-        number = int(raw.name.split("_")[0])
-        key = (raw.read_bytes().decode("utf-8"), (legacy / "baseline" / raw.name).read_bytes().decode("utf-8"))
-        hits = by_content.get(key, [])
-        if len(hits) != 1:
-            raise ExtractError(f"legacy case {raw.name} matches {len(hits)} cases by content")
-        existing = manifest[hits[0]]["legacy_id"]
-        if existing not in (None, number):
-            raise ExtractError(f"{hits[0]} already has legacy_id {existing}, content matches {number}")
-        manifest[hits[0]]["legacy_id"] = number
-    return len(raws)
-
-
 def in_dates(start: str, cfg: Config) -> bool:
     day = dt.date(int(start[:4]), int(start[4:6]), int(start[6:8]))
     return (cfg.since is None or day >= cfg.since) and (cfg.until is None or day <= cfg.until)
 
 
-def extract(
-    sessions: Path, cfg: Config, data: Path, legacy: Path | None = None
-) -> tuple[dict[str, int], dict[str, int]]:
+def extract(sessions: Path, cfg: Config, data: Path) -> tuple[dict[str, int], dict[str, int]]:
     """Merge cases from sessions into data/; returns counts and skips by reason for the summary."""
     if not sessions.is_dir():
         raise ExtractError(f"sessions folder not found: {sessions}")
@@ -210,10 +184,9 @@ def extract(
     manifest = read_manifest(manifest_path)
     rollouts = sorted(sessions.rglob("rollout-*.jsonl"), key=lambda f: f.name)
     on_disk = {f.name for f in rollouts}
-    counts = {"matched": 0, "episodes": 0, "new": 0, "existing": 0, "missing": 0, "legacy": 0}
+    counts = {"matched": 0, "episodes": 0, "new": 0, "existing": 0, "missing": 0}
     skips: dict[str, int] = {}
     seen: dict[str, str] = {}
-    content: dict[str, tuple[str, str | None]] = {}
     pending: list[tuple[Path, dict[str, str | None]]] = []
 
     def skip(reason: str) -> None:
@@ -243,7 +216,6 @@ def extract(
                 raise ExtractError(f"case id {case_id} from both {seen[case_id]} and {f.name}")
             seen[case_id] = f.name
             files = case_files(ep)
-            content[case_id] = (ep.transcript, ep.output)
             case_dir = cases / case_id
             if case_id in manifest:
                 if manifest[case_id]["rollout"] != f.name:
@@ -264,8 +236,6 @@ def extract(
             row["missing_log"] = True
             counts["missing"] += 1
             print(f"WARNING: {cid}: rollout {row['rollout']} is no longer on disk", file=sys.stderr)
-    if legacy is not None:
-        counts["legacy"] = map_legacy(manifest, content, legacy)
     for case_dir, files in pending:
         case_dir.mkdir(parents=True)
         for name, text in files.items():
@@ -279,20 +249,17 @@ def extract(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--legacy", type=Path, help="old tests folder holding raw/ and baseline/")
-    args = parser.parse_args()
+    parser.parse_args()
     sessions = codex_sessions()
     print(f"sessions root: {sessions}")
     try:
-        c, skipped = extract(sessions, load_config(), DATA, args.legacy)
+        c, skipped = extract(sessions, load_config(), DATA)
     except (ConfigError, ExtractError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
     skips = ", ".join(f"{k} {v}" for k, v in sorted(skipped.items())) or "none"
     print(f"sessions matched {c['matched']}, episodes {c['episodes']}, skipped: {skips}")
     print(f"cases {c['cases']}: new {c['new']}, unchanged {c['existing']}, missing logs {c['missing']}")
-    if args.legacy:
-        print(f"legacy cases matched {c['legacy']}")
     return 0
 
 

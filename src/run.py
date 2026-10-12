@@ -3,15 +3,15 @@
     uv run python src/run.py --set quick --model gpt-6-luna --effort high
     uv run python src/run.py --set full --model gpt-6-sol --effort low --prompt a1b2c3d --dictionary
 
---set NAME         cases from data/sets/NAME.txt, one case id per line (quick, full, consistency, or a small dev set)
+--set NAME         cases from data/sets/NAME.txt, one case id per line (quick, full, or a small dev set)
 --model SLUG       model passed to every call, and recorded as the call's model
 --effort LEVEL     reasoning effort passed to every call
---repeats N        outputs per case (default 1; 5 for the consistency set)
 --prompt REV|PATH  cleaner commit whose AGENTS.md is staged (default HEAD), or a prompt file (run label file-<sha8>)
 --dictionary       also stage cleaner/dictionary.md beside the prompt
 --timeout SEC      limit per codex subprocess (default 600); a timeout or non-zero exit makes the call failed
 
-Writes the call cwd data/stage/<run_id>/ and data/runs/<run_id>/: spec.json, then <case_id>.<k>.json per call.
+One call per case. Writes the call cwd data/stage/<run_id>/ and data/runs/<run_id>/: spec.json, then
+<case_id>.json per case.
 A rerun skips complete records (failed ones run again) and refuses when spec.json differs, naming the fields.
 Exit 0 when every call has a record that is not failed; 1 otherwise or on an input error.
 """
@@ -398,7 +398,6 @@ def run(args: argparse.Namespace, root: Path, codex: list[str]) -> int:
         if not dict_path.is_file():
             raise RunError(f"--dictionary: missing {dict_path}")
         dictionary = dict_path.read_bytes()
-    repeats = args.repeats or (5 if args.set == "consistency" else 1)
     version = codex_version(codex)
     dict_hash = sha256(dictionary) if dictionary is not None else None
     spec = {
@@ -407,7 +406,6 @@ def run(args: argparse.Namespace, root: Path, codex: list[str]) -> int:
         "developer_sha256": sha256(prompt.developer.encode("utf-8")),
         "dictionary": dict_hash or "off",
         "set_version": set_version,
-        "repeats": repeats,
         "codex_version": version,
         "codex_home": str(home),
         "harness": harness(root),
@@ -422,37 +420,36 @@ def run(args: argparse.Namespace, root: Path, codex: list[str]) -> int:
     if dictionary is not None:
         (stage / "dictionary.md").write_bytes(dictionary)
 
-    calls = [(case, k) for case in cases for k in range(1, repeats + 1)]
-    todo = [(case, k) for case, k in calls if not complete(run_dir / f"{case.case_id}.{k}.json")]
-    print(f"{run_id}: {len(cases)} cases x {repeats} = {len(calls)} calls, {len(calls) - len(todo)} done, {len(todo)} to run")
-    for case, k in todo:
-        print(f"{case.case_id}.{k} ({case.words if case.words is not None else '?'} words) ...", end="", flush=True)
+    todo = [case for case in cases if not complete(run_dir / f"{case.case_id}.json")]
+    print(f"{run_id}: {len(cases)} cases, {len(cases) - len(todo)} done, {len(todo)} to run")
+    for case in todo:
+        print(f"{case.case_id} ({case.words if case.words is not None else '?'} words) ...", end="", flush=True)
         if not (run_dir / "spec.json").is_file():
             run_dir.mkdir(parents=True, exist_ok=True)
             write_json(run_dir / "spec.json", spec)
         record = run_call(case, codex, stage, prompt, args, version)
-        write_json(run_dir / f"{case.case_id}.{k}.json", record)
+        write_json(run_dir / f"{case.case_id}.json", record)
         print(f" {record['outcome']} {record['seconds']:.1f} s")
         if record.get("error"):
-            print(f"{case.case_id}.{k}: {record['error']}", file=sys.stderr)
+            print(f"{case.case_id}: {record['error']}", file=sys.stderr)
 
     records = {}
-    for case, k in calls:
-        path = run_dir / f"{case.case_id}.{k}.json"
+    for case in cases:
+        path = run_dir / f"{case.case_id}.json"
         if path.is_file():
-            records[f"{case.case_id}.{k}"] = json.loads(path.read_text(encoding="utf-8"))
+            records[case.case_id] = json.loads(path.read_text(encoding="utf-8"))
     outcomes = Counter(r["outcome"] for r in records.values())
     missing = sum(1 for r in records.values() if r["input_tokens"] is None)
     unmatched = [(key, p) for key, r in records.items() for p in r["unmatched"]]
     seconds = sum(r["seconds"] for r in records.values())
     print(
-        f"summary: {len(records)}/{len(calls)} records; "
+        f"summary: {len(records)}/{len(cases)} records; "
         + ", ".join(f"{o} {n}" for o, n in sorted(outcomes.items()))
         + f"; {seconds:.1f} s; missing usage {missing}; unmatched {len(unmatched)}"
     )
     for key, phrase in unmatched:
         print(f"unmatched {key}: {phrase}")
-    return 0 if len(records) == len(calls) and not outcomes["failed"] else 1
+    return 0 if len(records) == len(cases) and not outcomes["failed"] else 1
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -460,13 +457,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--set", required=True, help="data/sets/NAME.txt")
     parser.add_argument("--model", required=True)
     parser.add_argument("--effort", required=True)
-    parser.add_argument("--repeats", type=int, help="outputs per case (default 1; 5 for consistency)")
     parser.add_argument("--prompt", default="HEAD", help="cleaner rev or prompt file (default HEAD)")
     parser.add_argument("--dictionary", action="store_true", help="stage cleaner/dictionary.md")
     parser.add_argument("--timeout", type=float, default=600, help="seconds per codex subprocess (default 600)")
     args = parser.parse_args(argv)
-    if args.repeats is not None and args.repeats < 1:
-        parser.error("--repeats must be at least 1")
     codex = shutil.which("codex")
     try:
         if codex is None:

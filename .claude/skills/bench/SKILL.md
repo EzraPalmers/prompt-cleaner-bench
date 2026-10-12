@@ -1,6 +1,6 @@
 ---
 name: bench
-description: Benchmark the cleaner prompt. Use to extract cases from Codex logs, run a prompt, model and effort over a case set, judge the run with blind judge agents, read or add a row of outputs/results.md, and commit a prompt change and its results.
+description: Benchmark the cleaner prompt. Use to extract cases from Codex logs, run a prompt, model and effort over a case set, judge the run with blind judge agents, read or add a row of outputs/results.md, and tell the user what to commit for a prompt change and its results.
 ---
 
 # bench
@@ -28,33 +28,35 @@ instructions; read it only to edit it.
    cases already on disk, and cases whose log is gone (kept, marked `missing_log`). An `error:` line means nothing was
    written; report it, never edit files under `data/cases/` to get past it.
 
-Sets are `data/sets/<name>.txt`, one case id per line (`quick` about ten cases, `full` about fifty, `consistency`).
+Sets are `data/sets/<name>.txt`, one case id per line: `quick` (10 cases) and `full` (30, the quick ten plus 20). A
+run makes one output per case; there are no repeats.
 
 ## 2. Run a cell
 
-A run measures a committed prompt. Commit the `cleaner/AGENTS.md` change first (section 6), then run on `HEAD`.
+A run measures a committed prompt. The user commits the `cleaner/AGENTS.md` change first (section 6), then run on
+`HEAD`. `--prompt PATH` scores a prompt file while the cleaner working tree is being edited.
 
 ```
 uv run python src/run.py --set quick --model MODEL --effort LEVEL
 ```
 
-Flags, all that exist: `--set NAME`, `--model SLUG`, `--effort LEVEL`, `--repeats N` (default 1; 5 for
-`consistency`), `--prompt REV|PATH` (default `HEAD`; a file path labels the run `file-<sha8>`), `--dictionary` (stage
+Flags, all that exist: `--set NAME`, `--model SLUG`, `--effort LEVEL`, `--prompt REV|PATH` (default `HEAD`; a file
+path labels the run `file-<sha8>`), `--dictionary` (stage
 `cleaner/dictionary.md`; the run id and the results dictionary column then show `d` and the dictionary hash, such as
 `d5ad724`, never "on"), `--timeout SEC` (per call, default 600).
 
-- The run id starts the line `<run_id>: N cases x R = ... calls` printed at start: `<prompt>_<model>_<effort>_<set>_<dictionary>`, for example
+- The run id starts the line `<run_id>: N cases, D done, T to run` printed at start: `<prompt>_<model>_<effort>_<set>_<dictionary>`, for example
   `a1b2c3d_gpt-6-luna_high_quick_off`. Results land in `data/runs/<run_id>/`.
 - Resumable: rerunning the same command skips complete records and retries failed ones. Exit 1 means a call failed
   or an input error; rerun until the summary shows every record and no `failed`.
-- A changed spec (prompt text, developer line, dictionary, set, repeats, Codex version or home, harness) is refused
+- A changed spec (prompt text, developer line, dictionary, set, Codex version or home, harness) is refused
   with the field named. Do not delete the run folder yourself; tell the user, who removes `data/runs/<run_id>/` if the
   new spec is intended.
 - `unmatched` lines are suspect phrases with no recorded resolution. Tell the user how many before the row is relied
   on; each may be a real mishearing to add to a resolution (the `mine` skill), which changes the set version.
 - Quick run (about ten calls, about 500 s at high): run it in the foreground with a 600000 ms tool timeout. A run cut
   off by a timeout is simply rerun with the same command; it resumes.
-- Full run (about fifty calls, half an hour at high, longer above): never start it yourself. Give the user the exact
+- Full run (thirty calls, about 25 minutes at high, longer above): never start it yourself. Give the user the exact
   command to run in their own terminal, then continue from its summary.
 
 ## 3. Judge
@@ -76,8 +78,9 @@ Flags, all that exist: `--set NAME`, `--model SLUG`, `--effort LEVEL`, `--repeat
 
 ## 4. Read the result
 
-Score prints the run's critical-free %, kept % with its standard error, incomplete %, and the judge version, then
-regenerates `outputs/results.md` from every judged run. The comparison row is the row of the previous cleaner commit
+Score prints the run's critical-free %, kept % with its standard error, incomplete %, and the judge version, replaces
+the run's lines in the private per-case file `data/scores.jsonl`, then regenerates `outputs/results.md` from every
+judged run. The comparison row is the row of the previous cleaner commit
 that changed `AGENTS.md`, at the same model, effort, dictionary, set version and judge version. When it exists, score
 also prints `delta kept` and one line per case with that case's change in kept %. A `file-` prompt row and the first
 cleaner commit have no comparison row, so they print no delta and show `n/a`; that is correct. Read the negative
@@ -93,13 +96,12 @@ the cells and their run commands for the user, and judge each run as in section 
 
 ## 6. Commit
 
-1. Prompt: commit `cleaner/AGENTS.md` alone in the cleaner repository before running it, for example
-   `git -C cleaner commit -m "fix(prompt): keep hedges inside buried questions" -- AGENTS.md`. Start the edit from why
-   the cleaner fails, not from the symptom. A prompt commit a row names is never amended; a fix is a new commit.
-2. Results: after scoring, commit `outputs/results.md` in this repository, for example
+Never run git for the user; tell them what to commit.
+
+1. Prompt: `cleaner/AGENTS.md` alone, in the cleaner repository, before it is run, for example
+   `fix(prompt): keep hedges inside buried questions`. Start the edit from why the cleaner fails, not from the
+   symptom. A prompt commit a row names is never amended; a fix is a new commit.
+2. Results: after scoring, `outputs/results.md` in this repository, for example
    `chore(results): quick and full, gpt-6-luna high, on a1b2c3d`.
 3. Changes to `src/` or `.claude/agents/judge.md` are their own `feat(bench): ...` commits; a change to either starts a
    new judge version, and rows across judge versions are not compared.
-
-Both repositories' hooks run `src/check.py` against the private-term list; a block means private text was staged.
-Unstage it; never bypass the hook.
