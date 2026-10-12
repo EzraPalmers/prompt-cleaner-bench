@@ -1,0 +1,18 @@
+{
+  "output": "I want to rework how the export page loads, because it takes ages on big projects. The slow part is the thumbnail step. Could you check whether the thumbnails are generated on every request? I'll write the benchmark script tonight and you can review it tomorrow morning before the standup. We could cache the thumbnails on disk, or we could just generate them once at upload time. Maybe the cache should expire after a week, but I'm not sure that's long enough. The thing I care about most is that large exports stop timing out. Let's keep the old export path around until the new one has been tested.",
+  "suspect_lists": [],
+  "replies": [],
+  "unmatched": [],
+  "outcome": "clean",
+  "input_tokens": 21002,
+  "cached_input_tokens": 12000,
+  "cache_write_input_tokens": 0,
+  "output_tokens": 180,
+  "reasoning_output_tokens": 0,
+  "seconds": 32.0,
+  "model": "gpt-6-luna",
+  "effort": "high",
+  "codex_version": "0.162.1",
+  "session_id": "fixture-session-2",
+  "started": "2099-01-01T09:00:00Z"
+}
