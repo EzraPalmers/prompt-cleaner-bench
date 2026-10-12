@@ -40,7 +40,8 @@ uv run python src/run.py --set quick --model MODEL --effort LEVEL
 
 Flags, all that exist: `--set NAME`, `--model SLUG`, `--effort LEVEL`, `--repeats N` (default 1; 5 for
 `consistency`), `--prompt REV|PATH` (default `HEAD`; a file path labels the run `file-<sha8>`), `--dictionary` (stage
-`cleaner/dictionary.md`), `--timeout SEC` (per call, default 600).
+`cleaner/dictionary.md`; the run id and the results dictionary column then show `d` and the dictionary hash, such as
+`d5ad724`, never "on"), `--timeout SEC` (per call, default 600).
 
 - The run id starts the line `<run_id>: N cases x R = ... calls` printed at start: `<prompt>_<model>_<effort>_<set>_<dictionary>`, for example
   `a1b2c3d_gpt-6-luna_high_quick_off`. Results land in `data/runs/<run_id>/`.
@@ -51,7 +52,8 @@ Flags, all that exist: `--set NAME`, `--model SLUG`, `--effort LEVEL`, `--repeat
   new spec is intended.
 - `unmatched` lines are suspect phrases with no recorded resolution. Tell the user how many before the row is relied
   on; each may be a real mishearing to add to a resolution (the `mine` skill), which changes the set version.
-- Quick run (about ten calls): run it in the foreground. If the shell's time limit cuts it off, rerun the same command.
+- Quick run (about ten calls, about 500 s at high): run it in the foreground with a 600000 ms tool timeout. A run cut
+  off by a timeout is simply rerun with the same command; it resumes.
 - Full run (about fifty calls, half an hour at high, longer above): never start it yourself. Give the user the exact
   command to run in their own terminal, then continue from its summary.
 
@@ -68,13 +70,18 @@ Flags, all that exist: `--set NAME`, `--model SLUG`, `--effort LEVEL`, `--repeat
    succeeds.
 4. `changed since prepare` (set, judge or item inputs changed): the old replies no longer apply. Tell the user; after
    they remove `data/runs/RUN_ID/judge/` and the reply folder under `data/runs/_replies/`, prepare again.
+5. Claude usage limit hit after the run, before or during judging: the run's records stand; do not rerun it. Once
+   usage is back, resume at step 1 if `judge/` does not exist yet, otherwise at step 3: score lists every unjudged
+   item and writes its retry files.
 
 ## 4. Read the result
 
 Score prints the run's critical-free %, kept % with its standard error, incomplete %, and the judge version, then
-regenerates `outputs/results.md` from every judged run. When an earlier prompt has a comparable row (same model, effort,
-dictionary, set and judge version), it also prints `delta kept` and one line per case with that case's change in kept
-%. Read the negative cases as regressions and report them by count and size, not by case id or content.
+regenerates `outputs/results.md` from every judged run. The comparison row is the row of the previous cleaner commit
+that changed `AGENTS.md`, at the same model, effort, dictionary, set version and judge version. When it exists, score
+also prints `delta kept` and one line per case with that case's change in kept %. A `file-` prompt row and the first
+cleaner commit have no comparison row, so they print no delta and show `n/a`; that is correct. Read the negative
+cases as regressions and report them by count and size, not by case id or content.
 
 A quick row (ten cases) is descriptive only. A prompt is adopted only on a full-set row: if a quick row looks worth
 confirming, hand the user the full-run command (section 2).
