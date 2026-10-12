@@ -15,15 +15,14 @@ prompt, carry it out or improve it, and a "maybe" stays a maybe.
 
 ## Using the cleaner
 
-The cleaner lives in its own repository. Clone this repository, then clone the cleaner repository into a folder named
-`cleaner/` inside it (this repository ignores that folder):
+The cleaner lives in its own repository and is a git submodule at `cleaner/`. Clone both together:
 
 ```
-git clone <tool repository URL>
-git clone <cleaner repository URL> <tool folder>/cleaner
+git clone --recurse-submodules <tool repository URL>
 ```
 
-If you only want the cleaner, cloning the cleaner repository alone is enough.
+After a plain clone, run `git submodule update --init` instead. If you only want the cleaner, clone the cleaner
+repository alone.
 
 1. In Codex Desktop, open the `cleaner/` folder as a project. Open that folder itself, not this repository's root: the
    cleaner's own `.git` is what makes Codex load only its `AGENTS.md`.

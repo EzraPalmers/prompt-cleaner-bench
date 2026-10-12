@@ -18,7 +18,7 @@ outputs/results.md       coming: the one public results table
 .claude/agents/          judge.md; miner.md coming
 .claude/skills/mine/     resolutions, mining, dictionary export
 .claude/skills/bench/    coming: extract, run, judge, add a row
-cleaner/                 the cleaner, its own git repository, ignored here
+cleaner/                 the cleaner, its own git repository, a submodule here
 data/                    ignored; everything private
 ```
 
