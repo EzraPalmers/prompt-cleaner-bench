@@ -8,8 +8,8 @@ Usage:
   uv run python src/judge.py score --run RUN_ID
       Refuse if the set, the judge or any item's inputs changed since prepare. Validate every reply. If any is
       missing or invalid, list them and write judge/retry-NN.md, one per fresh judge (exit 1). Once all are valid,
-      score the run into judge/summary.json (per case and per length band) and regenerate outputs/results.md from
-      every judged run.
+      score the run into judge/summary.json (per case and per length band), print the per-case kept deltas against
+      the comparison row when one exists, and regenerate outputs/results.md from every judged run.
 
 Flags:
   --run RUN_ID  run folder name under <data>/runs/ (<prompt>_<model>_<effort>_<set>_<dictionary>)
@@ -567,7 +567,11 @@ def previous_prompt(prompt: str) -> str | None:
     return previous_change(prompt, [h[:7] for h in changes])
 
 
-def score(run: Run) -> dict:
+Previous = Callable[[str], str | None]
+
+
+def score(run: Run, previous: Previous) -> dict:
+    """Score the run into judge/summary.json and print the per-case kept deltas when a comparison row exists."""
     words = {c: len(run.transcript(c).split()) for c in run.cases}
     key = read_json(run.judge_dir / "key.json")
     stale = []
@@ -624,6 +628,11 @@ def score(run: Run) -> dict:
         "per_case": per_case,
     }
     write_text(run.judge_dir / "summary.json", json.dumps(summary, indent=2) + "\n")
+    found = find_delta(summary, load_summaries(run.data / "runs"), previous)
+    if found:
+        print(f"delta kept {found[0]}")
+        for case, d in found[1].items():
+            print(f"  {case}  {d:+.1f}")
     return summary
 
 
@@ -643,9 +652,6 @@ def load_summaries(runs: Path) -> list[dict]:
         if s["set"] != "consistency":
             summaries.append(s)
     return summaries
-
-
-Previous = Callable[[str], str | None]
 
 
 def find_delta(s: dict, summaries: list[dict], previous: Previous) -> tuple[str, dict] | None:
@@ -731,13 +737,8 @@ def main() -> int:
             paths = prepare(run)
             print(f"{len(paths)} batches in {run.judge_dir}")
             return 0
-        summary = score(run)
-        found = find_delta(summary, load_summaries(run.data / "runs"), previous_prompt)
-        if found:
-            print(f"delta kept {found[0]}")
-            for case, d in found[1].items():
-                print(f"  {case}  {d:+.1f}")
-        m = summary["metrics"]
+        summary = score(run, previous_prompt)
+        m =summary["metrics"]
         print(
             f"{run.id}: critical-free {fmt(m['critical_free'][0], 1)}%, kept {fmt(m['kept'][0], 1, m['kept'][1])}%, "
             f"incomplete {fmt(m['incomplete'][0], 1)}%; judge {summary['judge_version']}"

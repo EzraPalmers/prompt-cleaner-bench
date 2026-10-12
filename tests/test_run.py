@@ -188,6 +188,19 @@ def test_fourth_list_is_other_and_counts_its_phrases(root, tmp_path, monkeypatch
     assert record["outcome"] == "other" and len(record["replies"]) == 3 and record["unmatched"] == ["blue moose"]
 
 
+def test_list_with_prose_is_other_and_not_answered(root, tmp_path, monkeypatch):
+    prose = ("Suspect transcription issues:\n\n1. We went to the market. [Wait: wrong sentence?] Need the exact one: "
+             '"Then the blue moose left." I guess bold only moose.\nMaybe no issue at all? Let\'s list it.')  # fmt: skip
+    assert parse_list(prose) is None
+    assert parse_list(LIST + "\nI think that covers it.") is None
+    (root / "data" / "sets" / "dev.txt").write_text("c-list\n")
+    state, codex = fake(tmp_path, monkeypatch, [{"events": turn(prose, usage(10))}])
+    assert run(args(), root, codex) == 0
+    record = json.loads(next((root / "data" / "runs").glob("*/c-list.1.json")).read_text())
+    assert record["outcome"] == "other" and record["unmatched"] == [] and record["replies"] == []
+    assert json.loads(state.read_text())["done"] == 1
+
+
 def test_final_fenced_block():
     assert fenced("```text\nOne\n```\nexplanation\n```text\nTwo\n```") == "Two"
     assert fenced("no fence") is None and fenced("```text\nopen only") is None

@@ -10,6 +10,7 @@ from judge import JudgeError, Run, filler_count, paired_delta, regex_fillers, sp
 FIXTURE = Path(__file__).parent / "fixtures" / "judge"
 RUN_ID = "a1b2c3d_gpt-6-luna_high_quick_off"
 CASES = [f"20990101T090000-0{i}" for i in range(1, 5)]
+NONE = lambda prompt: None
 
 
 @pytest.fixture
@@ -189,13 +190,13 @@ def test_inputs_or_judge_changed_since_prepare_are_refused(data, monkeypatch):
     run = Run(data, RUN_ID)
     answer_all(run)
     with pytest.raises(JudgeError, match="inputs of items"):
-        judge.score(run)
+        judge.score(run, NONE)
     edit_record(data, CASES[1], output=original)
     run = Run(data, RUN_ID)
     answer_all(run)
     monkeypatch.setattr(judge, "judge_version", lambda: "def5678")
     with pytest.raises(JudgeError, match="judge opus abc1234 -> opus def5678"):
-        judge.score(run)
+        judge.score(run, NONE)
 
 
 def test_missing_reply_is_listed_then_scored_and_row_replaced(data):
@@ -205,10 +206,10 @@ def test_missing_reply_is_listed_then_scored_and_row_replaced(data):
     key = json.loads((run.judge_dir / "key.json").read_text())
     (judge.reply_dir(run, key) / "2.json").unlink()
     with pytest.raises(JudgeError, match="1 of 4 replies"):
-        judge.score(run)
+        judge.score(run, NONE)
     assert (run.judge_dir / "retry-01.md").read_text(encoding="utf-8").count("## Item 2\n") == 1
     answer_all(run)
-    summary = judge.score(run)
+    summary = judge.score(run, NONE)
     assert not list(run.judge_dir.glob("retry-*.md"))
     assert summary["metrics"]["kept"][0] == 100.0
     assert summary["judge_version"] == "abc1234"
@@ -224,7 +225,7 @@ def test_retries_are_bounded_like_batches(data, monkeypatch):
     run = Run(data, RUN_ID)
     judge.prepare(run)
     with pytest.raises(JudgeError, match="4 of 4 replies"):
-        judge.score(run)
+        judge.score(run, NONE)
     retries = sorted(run.judge_dir.glob("retry-*.md"))
     assert [p.read_text(encoding="utf-8").count("## Item") for p in retries] == [3, 1]
 
@@ -241,13 +242,30 @@ def test_other_call_scores_as_all_absent_and_incomplete(data):
         return r
 
     answer_all(run, drop_first)
-    m = judge.score(run)["metrics"]
+    m = judge.score(run, NONE)["metrics"]
     # four cases: other (kept 0, omissions 100), one omission in eight, two perfect
     assert m["kept"][0] == pytest.approx((0 + 87.5 + 100 + 100) / 4)
     assert m["omissions"][0] == pytest.approx((100 + 12.5) / 4)
     assert m["incomplete"][0] == 25.0
     assert m["critical_free"][0] == 50.0
     assert m["additions"][0] == 0.0  # the other call is excluded, not counted as zero-fault
+
+
+def test_score_prints_per_case_deltas_against_the_comparison_row(data, capsys):
+    run = Run(data, RUN_ID)
+    judge.prepare(run)
+    answer_all(run)
+    summary = judge.score(run, NONE)
+    assert "delta kept" not in capsys.readouterr().out
+    prior = json.loads(json.dumps(summary)) | {"prompt": "0000000"}
+    prior["per_case"][CASES[0]]["kept"] = 75.0
+    prior_dir = data / "runs" / "0000000_gpt-6-luna_high_quick_off" / "judge"
+    prior_dir.mkdir(parents=True)
+    (prior_dir / "summary.json").write_text(json.dumps(prior), encoding="utf-8")
+    judge.score(run, {"a1b2c3d": "0000000"}.get)
+    out = capsys.readouterr().out
+    assert "delta kept 6.2 (6.2) vs 0000000" in out
+    assert f"  {CASES[0]}  +25.0" in out and f"  {CASES[1]}  +0.0" in out
 
 
 def test_paired_delta():

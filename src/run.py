@@ -168,19 +168,21 @@ def matches(phrase: str, heard: str) -> bool:
 
 
 def parse_list(reply: str) -> list[tuple[int, list[str]]] | None:
-    """Numbered items of a suspect list with their bold phrases (the whole item when nothing is bold); None if the
-    reply is not a list."""
+    """Numbered items of a suspect list with their bold phrases; None unless every non-blank line after the heading is
+    a numbered item with a bold phrase, as the prompt's format has it."""
     text = reply.strip()
     if not text.startswith(LIST_HEAD):
         return None
-    items: list[tuple[int, str]] = []
+    items: list[tuple[int, list[str]]] = []
     for line in text[len(LIST_HEAD) :].splitlines():
+        if not line.strip():
+            continue
         m = ITEM.fullmatch(line)
-        if m:
-            items.append((int(m[1]), m[2]))
-        elif items and line.strip():
-            items[-1] = (items[-1][0], f"{items[-1][1]} {line.strip()}")
-    return [(n, BOLD.findall(body) or [body.strip()]) for n, body in items] or None
+        phrases = BOLD.findall(m[2]) if m else []
+        if m is None or not phrases:
+            return None
+        items.append((int(m[1]), phrases))
+    return items or None
 
 
 def answer(items: list[tuple[int, list[str]]], resolution: dict | None) -> tuple[str, list[str]]:
