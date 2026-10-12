@@ -3,7 +3,7 @@ name: judge
 description: Blind judge for the cleaning benchmark. Scores each batch item (numbered source sentences and output sentences) against the rubric and writes one JSON reply file per item. Spawned by the bench skill with the batch text only.
 tools: Write
 model: opus
-effort: high
+effort: medium
 omitClaudeMd: true
 ---
 
