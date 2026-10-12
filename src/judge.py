@@ -11,8 +11,17 @@ Usage:
       score the run into judge/summary.json (per case and per length band), print the per-case kept deltas against
       the comparison row when one exists, and regenerate outputs/results.md from every judged run.
 
+  uv run python src/judge.py calibrate
+      First call: from <data>/calibration/items.json (outputs with labelled faults, see its "about"), write two
+      independent judgings, calibration/judging-J/batch-NN.md and key.json, never two items of one case in a batch.
+      Hand each batch file to a fresh `judge` agent exactly as for a run. Later calls: validate the replies (writing
+      judging-J/retry-NN.md and exiting 1 while any is missing or invalid), then compute per check the detected rate
+      on labelled faults, the clean rate on untouched sentences per judging and Cohen's kappa between the judgings,
+      write calibration/report.json, print the table and the gate, and regenerate outputs/results.md with the
+      calibration footer. To recalibrate, trash calibration/judging-* and calibration/replies/.
+
 Flags:
-  --run RUN_ID  run folder name under <data>/runs/ (<prompt>_<model>_<effort>_<set>_<dictionary>)
+  --run RUN_ID  run folder name under <data>/runs/ (<prompt>_<model>_<effort>_<set>_<dictionary>); prepare and score
   --data DIR    data root holding cases/, sets/ and runs/ (default: the tool's data/); fixture runs use it to stay
                 out of the private data. outputs/results.md is always the tool's table.
 """
@@ -25,13 +34,14 @@ import re
 import secrets
 import subprocess
 import sys
+import textwrap
 from collections import Counter
 from collections.abc import Callable
 from pathlib import Path
 
 from config import ROOT
 from extract import band
-from run import RECORD_FIELDS, RunError, load_set, sha256
+from run import RECORD_FIELDS, RunError, load_resolution, load_set, sha256
 
 DATA = ROOT / "data"
 RESULTS = ROOT / "outputs" / "results.md"
@@ -399,8 +409,10 @@ def validate(reply, n_source: int, n_output: int) -> list[str]:
     return errors
 
 
-def check_replies(folder: Path, key: dict, sizes: dict[str, tuple[int, int]]) -> tuple[dict[str, dict], dict[str, str]]:
-    """Valid replies by call, and problems by item number."""
+def check_replies(
+    folder: Path, key: dict, sizes: dict[str, tuple[int, int]], name: str = "call"
+) -> tuple[dict[str, dict], dict[str, str]]:
+    """Valid replies by the key entry's `name` field (call, or calibration item), and problems by item number."""
     valid, problems = {}, {}
     for n, entry in key["items"].items():
         path = folder / f"{n}.json"
@@ -416,7 +428,7 @@ def check_replies(folder: Path, key: dict, sizes: dict[str, tuple[int, int]]) ->
         if errors:
             problems[n] = "invalid: " + "; ".join(errors[:3]) + (f" (+{len(errors) - 3})" if len(errors) > 3 else "")
         else:
-            valid[entry["call"]] = reply
+            valid[entry[name]] = reply
     return valid, problems
 
 
@@ -719,17 +731,269 @@ def render_table(summaries: list[dict], previous: Previous) -> str:
 
 def regenerate(data: Path, previous: Previous) -> int:
     summaries = load_summaries(data / "runs")
-    write_text(RESULTS, render_table(summaries, previous))
+    report = data / "calibration" / "report.json"
+    footer = calibration_footer(read_json(report)) if report.is_file() else ""
+    write_text(RESULTS, render_table(summaries, previous) + footer)
     return len(summaries)
+
+
+JUDGINGS = 2
+GATE_RATE = 0.9
+GATE_KAPPA = 0.6
+CAL_CHECKS = {
+    "present": "source", "hedges": "source", "mood": "source", "roles": "source", "alternatives": "source",
+    "missed_fixes": "source", "sourced": "output", "added": "output", "fillers": "output", "stubs": "output",
+    "wrong_fixes": "output",
+}  # fmt: skip
+CAL_KINDS = ("original", "perturbed", "feedback", "suspect")
+
+
+def flagged(reply: dict) -> dict[str, set[int]]:
+    """Unit ids each calibration check marks as a fault in one valid reply."""
+    src, out = reply["source"], reply["output"]
+    flags = {"present": {s["id"] for s in src if s["kind"] == "content" and s["present"] == "no"}}
+    flags |= {c: {s["id"] for s in src if s[c] == "no"} for c in CHECKS}
+    flags["missed_fixes"] = {e["source_id"] for e in reply["missed_fixes"]}
+    flags["sourced"] = {o["id"] for o in out if o["sourced"] == "no"}
+    flags["added"] = {o["id"] for o in out if o["sourced"] == "yes" and o["added"]}
+    for check, name in (("fillers", "fillers_left"), ("stubs", "stubs_left"), ("wrong_fixes", "wrong_fixes")):
+        flags[check] = {e["output_id"] for e in reply[name]}
+    return flags
+
+
+def kappa(a: list[bool], b: list[bool]) -> float | None:
+    """Cohen's kappa of two binary ratings; None when chance agreement is total."""
+    n = len(a)
+    observed = sum(x == y for x, y in zip(a, b)) / n
+    pa, pb = sum(a) / n, sum(b) / n
+    chance = pa * pb + (1 - pa) * (1 - pb)
+    return None if chance == 1 else (observed - chance) / (1 - chance)
+
+
+class Calibration:
+    """Calibration items from <data>/calibration/items.json with their judge inputs."""
+
+    def __init__(self, data: Path):
+        self.data = data
+        self.dir = data / "calibration"
+        doc = read_json(self.dir / "items.json")
+        self.items = {it["id"]: it for it in doc["items"]}
+        self.parts: dict[str, tuple[list[dict], list[str], list[str]]] = {}
+        for item_id, it in self.items.items():
+            folder = data / "cases" / it["case"]
+            try:
+                transcript = (folder / "transcript.txt").read_text(encoding="utf-8")
+                path = folder / "resolution.json"
+                resolution = load_resolution(path, path.read_bytes()) if path.is_file() else None
+            except (OSError, RunError) as exc:
+                raise JudgeError(f"{item_id}: {exc}") from exc
+            corrections = resolution["corrections"] if resolution else []
+            self.parts[item_id] = (corrections, split_sentences(transcript), split_sentences(it["output"]))
+            self._check(item_id, it)
+
+    def _check(self, item_id: str, it: dict) -> None:
+        if it["kind"] not in CAL_KINDS:
+            raise JudgeError(f"{item_id}: kind {it['kind']!r} not in {CAL_KINDS}")
+        _, source, output = self.parts[item_id]
+        bounds = {"source": len(source), "output": len(output)}
+        units = [(side, i) for lab in [*it["labels"], it["exclude"]] for side in bounds for i in lab[f"{side}_ids"]]
+        for side, i in units:
+            if not 1 <= i <= bounds[side]:
+                raise JudgeError(f"{item_id}: {side} id {i} outside 1..{bounds[side]}")
+        for lab in it["labels"]:
+            if lab["check"] not in CAL_CHECKS:
+                raise JudgeError(f"{item_id}: unknown check {lab['check']!r}")
+            if not lab[f"{CAL_CHECKS[lab['check']]}_ids"]:
+                raise JudgeError(f"{item_id}: a {lab['check']} label needs {CAL_CHECKS[lab['check']]}_ids")
+
+    def sizes(self, item_id: str) -> tuple[int, int]:
+        _, source, output = self.parts[item_id]
+        return len(source), len(output)
+
+    def text(self, item_id: str, n: int, replies: Path) -> str:
+        return item_text(n, replies / f"{n}.json", *self.parts[item_id])
+
+
+def pack_apart(items: list[tuple[int, str, int, str]]) -> list[list[tuple[int, str]]]:
+    """First-fit (number, text, entries, case) items into batches within MAX_ITEMS and MAX_TOKENS, one item per case."""
+    batches: list[tuple[list[tuple[int, str]], list[int], set[str]]] = []
+    for n, text, entries, case in items:
+        est = estimate_tokens(text, entries)
+        if est > MAX_TOKENS:
+            raise JudgeError(f"item {n} alone needs ~{est} tokens, over the {MAX_TOKENS} batch ceiling")
+        for members, used, cases in batches:
+            if len(members) < MAX_ITEMS and used[0] + est <= MAX_TOKENS and case not in cases:
+                break
+        else:
+            members, used, cases = [], [0], set()
+            batches.append((members, used, cases))
+        members.append((n, text))
+        used[0] += est
+        cases.add(case)
+    return [members for members, _, _ in batches]
+
+
+def calibration_prepare(cal: Calibration) -> list[Path]:
+    """Write judging-J/batch-NN.md and judging-J/key.json for each judging, each with its own order and replies."""
+    paths = []
+    for j in range(1, JUDGINGS + 1):
+        folder = cal.dir / f"judging-{j}"
+        key: dict = {"token": secrets.token_hex(6), "judge_model": judge_model(), "judge_version": judge_version()}
+        key["items"] = {}
+        replies = cal.dir / "replies" / key["token"]
+        order = list(cal.items)
+        random.SystemRandom().shuffle(order)
+        items = []
+        for n, item_id in enumerate(order, 1):
+            text = cal.text(item_id, n, replies)
+            items.append((n, text, sum(cal.sizes(item_id)), cal.items[item_id]["case"]))
+            key["items"][str(n)] = {"item": item_id, "sha256": sha256(text.encode("utf-8"))}
+        replies.mkdir(parents=True, exist_ok=True)
+        batches = pack_apart(items)
+        paths += write_batches(folder, "batch", batches)
+        write_text(folder / "key.json", json.dumps(key, indent=2) + "\n")
+    return paths
+
+
+def calibration_replies(cal: Calibration) -> tuple[list[dict[str, dict]], dict]:
+    """Valid replies by item id per judging, and the judge of the keys; writes retry files and fails on any gap."""
+    judgings, problems, retries, judges = [], [], [], set()
+    for j in range(1, JUDGINGS + 1):
+        folder = cal.dir / f"judging-{j}"
+        key = read_json(folder / "key.json")
+        judges.add((key["judge_model"], key["judge_version"]))
+        replies = cal.dir / "replies" / key["token"]
+        texts = {n: cal.text(e["item"], int(n), replies) for n, e in key["items"].items()}
+        if {e["item"] for e in key["items"].values()} != set(cal.items):
+            raise JudgeError(f"items.json changed since prepare; trash {cal.dir}/judging-* and replies/, prepare again")
+        changed = [n for n, t in texts.items() if sha256(t.encode("utf-8")) != key["items"][n]["sha256"]]
+        current = (judge_model(), judge_version())
+        if changed or (key["judge_model"], key["judge_version"]) != current:
+            raise JudgeError(
+                f"judging {j}: judge or item inputs changed since prepare; trash {cal.dir}/judging-* and replies/, "
+                "then prepare again"
+            )
+        sizes = {n: cal.sizes(e["item"]) for n, e in key["items"].items()}
+        valid, missing = check_replies(replies, key, sizes, "item")
+        for old in folder.glob("retry-*.md"):
+            old.unlink()
+        if missing:
+            problems += [f"judging {j} item {n}: {missing[n]}" for n in sorted(missing, key=int)]
+            pack_in = [(int(n), texts[n], sum(sizes[n]), cal.items[key["items"][n]["item"]]["case"]) for n in missing]
+            retries += write_batches(folder, "retry", pack_apart(sorted(pack_in)))
+        judgings.append(valid)
+    if problems:
+        print("\n".join(problems))
+        raise JudgeError(
+            f"{len(problems)} replies missing or invalid; one fresh judge per file: " + ", ".join(map(str, retries))
+        )
+    model, version = judges.pop()
+    return judgings, {"judge_model": model, "judge_version": version}
+
+
+def calibration_report(cal: Calibration, judgings: list[dict[str, dict]], judge: dict) -> dict:
+    """Detection rate on labelled faults, clean rate on untouched units and kappa between judgings, per check."""
+    flags = [{item_id: flagged(r) for item_id, r in judging.items()} for judging in judgings]
+    checks = {}
+    for check, side in CAL_CHECKS.items():
+        labels = [(i, lab) for i, it in cal.items.items() for lab in it["labels"] if lab["check"] == check]
+        detected = [sum(bool(f[i][check] & set(lab[f"{side}_ids"])) for i, lab in labels) for f in flags]
+        clean_units, units = [], []
+        for i, it in cal.items.items():
+            n_units = cal.sizes(i)[0 if side == "source" else 1]
+            touched = {u for lab in it["labels"] for u in lab[f"{side}_ids"]} | set(it["exclude"][f"{side}_ids"])
+            units += [(i, u) for u in range(1, n_units + 1)]
+            if it["negatives"]:
+                clean_units += [(i, u) for u in range(1, n_units + 1) if u not in touched]
+        clean = [sum(u not in f[i][check] for i, u in clean_units) for f in flags]
+        k = kappa(*[[u in f[i][check] for i, u in units] for f in flags])
+        tpr = [d / len(labels) if labels else None for d in detected]
+        tnr = [c / len(clean_units) if clean_units else None for c in clean]
+        rates = [r for r in tpr + tnr if r is not None]
+        checks[check] = {
+            "faults": len(labels),
+            "detected": tpr,
+            "untouched": len(clean_units),
+            "clean": tnr,
+            "units": len(units),
+            "kappa": k,
+            "pass": bool(labels) and all(r >= GATE_RATE for r in rates) and k is not None and k >= GATE_KAPPA,
+        }
+    feedback = [(i, lab) for i, it in cal.items.items() for lab in it["labels"] if lab.get("origin") == "feedback"]
+    side = {lab["check"]: CAL_CHECKS[lab["check"]] for _, lab in feedback}
+    return {
+        **judge,
+        "judgings": JUDGINGS,
+        "gate": {"rate": GATE_RATE, "kappa": GATE_KAPPA},
+        "items": dict(Counter(it["kind"] for it in cal.items.values())),
+        "faults_by_defect": dict(Counter(lab["defect"] for it in cal.items.values() for lab in it["labels"])),
+        "feedback_detected": [
+            sum(bool(f[i][lab["check"]] & set(lab[f"{side[lab['check']]}_ids"])) for i, lab in feedback) for f in flags
+        ],
+        "feedback_labels": len(feedback),
+        "checks": checks,
+    }
+
+
+def calibration_table(report: dict) -> list[str]:
+    def rates(values: list[float | None]) -> str:
+        return ", ".join(fmt(v, 2) for v in values)
+
+    lines = ["| check | faults | detected | untouched | clean | kappa | gate |", "|---|---|---|---|---|---|---|"]
+    for check, c in report["checks"].items():
+        gate = "pass" if c["pass"] else "fail"
+        lines.append(
+            f"| {check} | {c['faults']} | {rates(c['detected'])} | {c['untouched']} | {rates(c['clean'])} | "
+            f"{fmt(c['kappa'], 2)} | {gate} |"
+        )
+    return lines
+
+
+def calibration_footer(report: dict) -> str:
+    items = report["items"]
+    counts = ", ".join(f"{items[k]} {k}" for k in CAL_KINDS if k in items)
+    faults = sum(c["faults"] for c in report["checks"].values())
+    text = (
+        f"Judge {report['judge_model']} {report['judge_version']}. {sum(items.values())} items ({counts}) with "
+        f"{faults} labelled faults, each judged by {report['judgings']} fresh judges. Detected is the share of "
+        "labelled faults a judging flags, clean the share of untouched sentences it leaves unflagged; each judging is "
+        "shown separately, never averaged. Kappa is Cohen's between the judgings. Gate: every rate at least "
+        f"{report['gate']['rate']}, kappa at least {report['gate']['kappa']}."
+    )
+    lines = ["", "## Judge calibration", "", textwrap.fill(text, 118), "", *calibration_table(report)]
+    return "\n".join(lines) + "\n"
+
+
+def calibrate(data: Path, previous: Previous) -> int:
+    cal = Calibration(data)
+    if not (cal.dir / "judging-1" / "key.json").exists():
+        paths = calibration_prepare(cal)
+        print(f"calibration: {len(cal.items)} items x {JUDGINGS} judgings, {len(paths)} batches; one fresh judge each:")
+        print("\n".join(str(p) for p in paths))
+        return 0
+    judgings, judge = calibration_replies(cal)
+    report = calibration_report(cal, judgings, judge)
+    write_text(cal.dir / "report.json", json.dumps(report, indent=2) + "\n")
+    print("\n".join(calibration_table(report)))
+    failed = [c for c, v in report["checks"].items() if not v["pass"]]
+    verdict = "failed by " + ", ".join(failed) if failed else "passed"
+    print(f"judge {judge['judge_model']} {judge['judge_version']}: gate {verdict}")
+    rows = regenerate(data, previous)
+    print(f"{RESULTS.name}: {rows} rows and the calibration footer")
+    return 0
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Judge batches and scoring for the cleaning benchmark.")
-    parser.add_argument("command", choices=("prepare", "score"))
-    parser.add_argument("--run", required=True, help="run folder name under <data>/runs/")
+    parser.add_argument("command", choices=("prepare", "score", "calibrate"))
+    parser.add_argument("--run", help="run folder name under <data>/runs/ (prepare and score)")
     parser.add_argument("--data", type=Path, default=DATA, help="data root holding cases/, sets/ and runs/")
     args = parser.parse_args()
+    if args.command != "calibrate" and not args.run:
+        parser.error(f"{args.command} needs --run")
     try:
+        if args.command == "calibrate":
+            return calibrate(args.data.resolve(), previous_prompt)
         run = Run(args.data.resolve(), args.run)
         if args.command == "prepare":
             judged = sum(r["outcome"] in JUDGED for r in run.records.values())

@@ -268,6 +268,59 @@ def test_score_prints_per_case_deltas_against_the_comparison_row(data, capsys):
     assert f"  {CASES[0]}  +25.0" in out and f"  {CASES[1]}  +0.0" in out
 
 
+CLEAN = (
+    "I want to rework how the export page loads because it takes ages on big projects. I think the slow part is "
+    "probably the thumbnail step. Could you check whether the thumbnails are generated on every request? I'll write "
+    "the benchmark script tonight and you can review it tomorrow morning before the standup. We could cache the "
+    "thumbnails on disk, or we could just generate them once at upload time. Maybe the cache should expire after a "
+    "week, but I'm not sure that's long enough. The thing I care about most is that large exports stop timing out. "
+    "Let's keep the old export path around until the new one has been tested."
+)
+
+
+def test_calibration_batches_apart_then_reports_rates_kappa_and_footer(data, capsys):
+    hardened = CLEAN.replace("I think the slow part is probably", "The slow part is")
+    hedge = {"check": "hedges", "defect": "hedge removed", "source_ids": [2], "output_ids": [2]}
+    none = {"source_ids": [], "output_ids": []}
+    items = [
+        {"id": "o", "case": CASES[0], "kind": "original", "negatives": True, "output": CLEAN, "labels": [],
+         "exclude": none},
+        {"id": "p", "case": CASES[0], "kind": "perturbed", "negatives": True, "output": hardened, "labels": [hedge],
+         "exclude": none},
+        {"id": "q", "case": CASES[1], "kind": "original", "negatives": True, "output": CLEAN, "labels": [],
+         "exclude": {"source_ids": [6], "output_ids": [6]}},
+    ]  # fmt: skip
+    (data / "calibration").mkdir()
+    (data / "calibration" / "items.json").write_text(json.dumps({"items": items}), encoding="utf-8")
+    assert judge.calibrate(data, NONE) == 0
+    for j in (1, 2):
+        batches = sorted((data / "calibration" / f"judging-{j}").glob("batch-*.md"))
+        assert len(batches) == 2  # o and p share a case, so they never share a batch
+
+    def answer(j: int, flags: dict[str, list[int]]) -> None:
+        key = json.loads((data / "calibration" / f"judging-{j}" / "key.json").read_text())
+        for n, entry in key["items"].items():
+            r = reply(8, 8)
+            for s in flags.get(entry["item"], []):
+                r["source"][s - 1]["hedges"] = "no"
+            (data / "calibration" / "replies" / key["token"] / f"{n}.json").write_text(json.dumps(r))
+
+    answer(1, {"p": [2], "q": [6]})
+    with pytest.raises(JudgeError, match="3 replies missing"):
+        judge.calibrate(data, NONE)
+    answer(2, {"p": [2], "o": [6], "q": [6]})
+    judge.calibrate(data, NONE)
+    hedges = json.loads((data / "calibration" / "report.json").read_text())["checks"]["hedges"]
+    # p's S2 is labelled and q's S6 excluded, so 8 + 7 + 7 untouched units; o's S6 is a false flag in judging 2 only
+    assert hedges["detected"] == [1.0, 1.0] and hedges["untouched"] == 22
+    assert hedges["clean"] == [1.0, pytest.approx(21 / 22)]
+    assert hedges["kappa"] == pytest.approx(7 / 9) and hedges["pass"] is True
+    table = judge.RESULTS.read_text(encoding="utf-8")
+    assert "## Judge calibration" in table and "| hedges | 1 | 1.00, 1.00 | 22 | 1.00, 0.95 | 0.78 | pass |" in table
+    assert "2099" not in table and "thumbnail" not in table
+    assert "gate failed by" in capsys.readouterr().out
+
+
 def test_paired_delta():
     mean, se, deltas = paired_delta({"a": 90.0, "b": 80.0, "c": 70.0}, {"a": 80.0, "b": 80.0, "c": 60.0})
     assert deltas == {"a": 10.0, "b": 0.0, "c": 10.0}

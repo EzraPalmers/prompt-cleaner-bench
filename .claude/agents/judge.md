@@ -89,7 +89,11 @@ an invented sentence, a summary or judgement the speaker never made, text from n
 added quotes, from the output, each qualifier, actor, number, condition, instruction, example or judgement in a
 sourced sentence that the transcript does not carry ("the tests fail" becoming "the tests fail on every run"; "check
 the config" becoming "check the config and fix it"). Use [] when nothing is added. An unsourced sentence also takes
-[]: it already counts whole. Keeping the abandoned version of a self-correction in place of the speaker's final one is
+[]: it already counts whole. A change to something the speaker did say is not an addition: an actor swapped or
+reassigned, a hedge removed, hardened or moved, a question or request turned into a claim, or options collapsed is
+recorded once, under hedges, mood, roles or alternatives on the source sentence, and never quoted here as well.
+Apart from the self-correction case below, `added` holds only material that has no counterpart in the transcript.
+Keeping the abandoned version of a self-correction in place of the speaker's final one is
 an addition here and a loss on the source sentence.
 
 ## Lists
