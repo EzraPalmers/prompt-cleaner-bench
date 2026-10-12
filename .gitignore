@@ -6,4 +6,3 @@ CLAUDE.local.md
 !.claude/agents/
 .venv/
 __pycache__/
-cleaner/
