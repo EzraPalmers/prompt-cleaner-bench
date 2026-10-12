@@ -1,0 +1,26 @@
+[project]
+name = "prompt-cleaner"
+version = "0.1.0"
+description = "Benchmark tooling for a voice-dictation cleaning prompt run in Codex"
+requires-python = ">=3.12"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "pyright>=1.1.414",
+    "pytest>=9.1.1",
+    "ruff>=0.17.0",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.pyright]
+include = ["src"]
+exclude = ["tests", "notebooks", "tmp", "**/node_modules", "**/__pycache__", "**/.venv", "**/.*"]
+typeCheckingMode = "standard"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

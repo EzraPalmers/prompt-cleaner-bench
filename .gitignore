@@ -1,0 +1,9 @@
+data/
+bench.toml
+CLAUDE.local.md
+.claude/*
+!.claude/skills/
+!.claude/agents/
+.venv/
+__pycache__/
+cleaner/
