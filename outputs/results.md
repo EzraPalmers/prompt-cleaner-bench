@@ -7,3 +7,4 @@ comparable only at the same set version and judge version. Cost is list price, a
 
 | prompt | model | effort | dictionary | set | n | kept % (SE) | critical faults /100 sentences | omissions /100 | distortions /100 | additions /case | fillers /1k words | critical-free % | delta kept | flags /case | wrong fixes /case | missed fixes /case | incomplete % | tokens /call | cost /call (USD) | seconds /call | judge | harness |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| fef7aca | gpt-6-luna | high | off | quick@ee1787 | 10 | 97.5 (0.6) | 2.6 | 1.9 | 0.5 | 0.10 | 1.8 | 20.0 | n/a | 0.30 | 0.30 | 0.90 | 0.0 | 32678 | 0.0029 | 27.3 | opus/direct 5612773 | 5612773 |
