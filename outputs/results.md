@@ -6,3 +6,6 @@ rows are comparable only at the same set version and judge version. Cost is list
 
 | prompt | model | effort | dictionary | set | n | critical-free % | kept % | delta kept | omissions /100 | distortions /100 | additions /case | fillers /1k words | wrong fixes /case | missed fixes /case | incomplete % | flags /case | tokens /call | reasoning /call | cost /call (USD) | seconds /call | judge | harness |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 51d9a57 | gpt-6-luna | high | d5ad724 | quick@ee1787 | 10 | 40.0 (16.3) | 98.6 (0.5) | n/a | 0.8 (0.5) | 0.5 (0.3) | 0.10 (0.10) | 2.3 (0.8) | 0.00 (0.00) | 1.00 (0.26) | 0.0 (0.0) | 0.40 (0.16) | 34545 | 2007 | 0.0026 | 37.7 | opus 7615f39 | 7615f39 |
+| 51d9a57 | gpt-6-luna | high | off | quick@ee1787 | 10 | 40.0 (16.3) | 97.2 (1.0) | n/a | 0.8 (0.4) | 2.0 (0.9) | 0.10 (0.10) | 2.4 (0.8) | 0.10 (0.10) | 0.80 (0.29) | 0.0 (0.0) | 0.60 (0.16) | 39531 | 1876 | 0.0029 | 49.8 | opus 7615f39 | 7615f39 |
+| file-6d3a7f83 | gpt-6-luna | high | off | quick@ee1787 | 10 | 50.0 (16.7) | 98.1 (0.9) | n/a | 1.2 (0.6) | 0.8 (0.4) | 0.20 (0.13) | 2.5 (0.7) | 0.10 (0.10) | 1.00 (0.33) | 0.0 (0.0) | 0.30 (0.15) | 32629 | 2319 | 0.0029 | 36.5 | opus 7615f39 | 7615f39 |
