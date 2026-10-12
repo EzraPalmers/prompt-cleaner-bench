@@ -1,19 +1,23 @@
 """Blind judge batches, reply validation, scoring and the public results table.
 
 Usage:
-  uv run python src/judge.py prepare --run RUN_ID
+  uv run python src/judge.py prepare --run RUN_ID [--method sentence|direct|chunked]
       Write blind batch files to data/runs/RUN_ID/judge/batch-NN.md and the item key to judge/key.json. The key
-      records the set version, the judge model and version, and a hash of every item as prepared.
-      The bench skill hands each batch file's text, and nothing else, to a fresh `judge` agent.
-  uv run python src/judge.py score --run RUN_ID
-      Refuse if the set, the judge or any item's inputs changed since prepare. Validate every reply. If any is
-      missing or invalid, list them and write judge/retry-NN.md, one per fresh judge (exit 1). Once all are valid,
-      score the run into judge/summary.json (per case and per length band), replace the run's lines in the private
-      <data>/scores.jsonl (one line per case), print the per-case kept deltas against the comparison row when one
-      exists, and regenerate outputs/results.md from every judged run.
+      records the method, the set version, the judge model and version, and a hash of every item as prepared.
+      The bench skill hands each batch file's text, and nothing else, to a fresh agent of the method: `judge`
+      (sentence), `judge-direct` or `judge-chunked`.
+  uv run python src/judge.py score --run RUN_ID [--method sentence|direct|chunked]
+      Refuse if the method differs from prepare's, or the set, the judge or any item's inputs changed since prepare.
+      Validate every reply. If any is missing or invalid, list them and write judge/retry-NN.md, one per fresh judge
+      (exit 1). Once all are valid, score the run into judge/summary.json (per case and per length band), replace
+      the run's lines in the private <data>/scores.jsonl (one line per case), print the per-case kept deltas against
+      the comparison row when one exists, and regenerate outputs/results.md from every judged run.
 
 Flags:
   --run RUN_ID  run folder name under <data>/runs/ (<prompt>_<model>_<effort>_<set>_<dictionary>)
+  --method M    judging method (default sentence): sentence answers every source and output sentence; direct
+                tallies only the faults of a dictation; chunked gives that tally per transcript part. A method other
+                than sentence prefixes the judge version, so its rows never compare with another method's.
   --data DIR    data root holding cases/, sets/ and runs/ (default: the tool's data/); fixture runs use it to stay
                 out of the private data. outputs/results.md is always the tool's table.
 """
@@ -28,6 +32,7 @@ import subprocess
 import sys
 from collections import Counter
 from collections.abc import Callable
+from itertools import pairwise
 from pathlib import Path
 
 from config import ROOT
@@ -37,13 +42,21 @@ from run import RECORD_FIELDS, RunError, load_set, sha256
 DATA = ROOT / "data"
 RESULTS = ROOT / "outputs" / "results.md"
 CLEANER = ROOT / "cleaner"
-JUDGE_PATHS = (".claude/agents/judge.md", "src/judge.py")
+AGENTS = {
+    "sentence": ".claude/agents/judge.md",
+    "direct": ".claude/agents/judge-direct.md",
+    "chunked": ".claude/agents/judge-chunked.md",
+}
+JUDGE_CODE = "src/judge.py"
 REPLIES = "_replies"
 
 MAX_ITEMS = 5
 MAX_TOKENS = 80_000
 TOKENS_PER_ENTRY = 110
+REPLY_TOKENS = {"direct": 400, "chunked": 600}
 TOKENS_THINKING = 3_000
+CHUNK_OVER = 200
+CHUNK_WORDS = 150
 
 # USD per 1M tokens (input, cached input, cache write, output), standard tier, short context, from
 # https://developers.openai.com/api/docs/pricing fetched 2026-10-13. A comparison measure, not the plan's bill.
@@ -79,6 +92,20 @@ LIST_KEYS = {
     "missed_fixes": {"source_id": "source", "transcript": str},
 }
 REPLY_KEYS = {"source", "output", *LIST_KEYS}
+
+FAULT_TYPES = {"dropped", "clause", "hedge", "mood", "roles", "alternatives"}
+OMISSION_TYPES = {"dropped", "clause"}
+# field kinds: "id" a source sentence id, "type" a fault type, "transcript"/"output" an exact quote from that text,
+# "text" any non-empty string; a bare kind is a list of such values
+TALLY_LISTS: dict[str, dict[str, str] | str] = {
+    "faults": {"s": "id", "type": "type", "quote": "transcript"},
+    "added": "output",
+    "stubs_left": "output",
+    "wrong_fixes": {"transcript": "text", "output": "output"},
+    "missed_fixes": {"s": "id", "transcript": "transcript"},
+}
+TALLY_KEYS = {"noise", "content_sentences", "fillers_left", *TALLY_LISTS}
+PART_KEYS = {"part", "output", *TALLY_KEYS}
 
 METRICS = (
     "critical_free",
@@ -120,6 +147,35 @@ def split_sentences(text: str) -> list[str]:
     return sentences
 
 
+def paragraphs(text: str) -> list[list[str]]:
+    """split_sentences grouped by paragraph; the groups concatenate to split_sentences(text)."""
+    return [group for group in map(split_sentences, PARAGRAPH.split(text)) if group]
+
+
+def chunks(text: str) -> list[list[str]]:
+    """Transcript parts: each paragraph, or for one over CHUNK_OVER words, blocks closing at the first sentence end
+    past CHUNK_WORDS words."""
+    parts = []
+    for group in paragraphs(text):
+        if sum(len(s.split()) for s in group) <= CHUNK_OVER:
+            parts.append(group)
+            continue
+        block, words = [], 0
+        for s in group:
+            block.append(s)
+            words += len(s.split())
+            if words > CHUNK_WORDS:
+                parts.append(block)
+                block, words = [], 0
+        if block:
+            parts.append(block)
+    return parts
+
+
+def norm(text: str) -> str:
+    return " ".join(text.split()).lower()
+
+
 def regex_fillers(sentence: str) -> Counter[str]:
     """Unambiguous fillers in one sentence, by lowercase token."""
     found = Counter(re.sub(r"[\s,]", "", m.group()).lower() for m in UNAMBIGUOUS.finditer(sentence))
@@ -145,6 +201,21 @@ def filler_count(output: list[str], fillers_left: list[dict]) -> int:
                 continue
         listed[(i, token)] += 1
         total += 1
+    return total
+
+
+def tally_fillers(output: str, fillers_left: dict[str, int]) -> int:
+    """Regex fillers plus, per judge token, at most its occurrences in the output the regex did not count."""
+    regex: Counter[str] = Counter()
+    for s in split_sentences(output):
+        regex += regex_fillers(s)
+    judged: Counter[str] = Counter()
+    for token, n in fillers_left.items():
+        judged[norm(token)] += n
+    total = sum(regex.values())
+    for token, n in judged.items():
+        occurrences = len(re.findall(rf"\b{re.escape(token)}\b", output, re.IGNORECASE))
+        total += min(n, max(0, occurrences - regex[token]))
     return total
 
 
@@ -228,12 +299,33 @@ class Run:
         return resolution["corrections"] if resolution else []
 
 
-def item_text(n: int, reply: Path, corrections: list[dict], source: list[str], output: list[str]) -> str:
+def item_head(n: int, reply: Path, corrections: list[dict]) -> list[str]:
     lines = [f"## Item {n}", "", f"Reply path: {reply}", "", "Confirmed corrections (heard -> meant):"]
-    lines += [f'- "{c["heard"]}" -> "{c["meant"]}"' for c in corrections] or ["- none"]
+    return lines + ([f'- "{c["heard"]}" -> "{c["meant"]}"' for c in corrections] or ["- none"])
+
+
+def item_text(n: int, reply: Path, corrections: list[dict], source: list[str], output: list[str]) -> str:
+    lines = item_head(n, reply, corrections)
     lines += ["", "Source sentences:"] + [f"S{i}: {s}" for i, s in enumerate(source, 1)]
     lines += ["", "Output sentences:"] + [f"O{i}: {s}" for i, s in enumerate(output, 1)]
     return "\n".join(lines) + "\n"
+
+
+def numbered(groups: list[list[str]], prefix: str) -> tuple[list[str], list[range]]:
+    """One line per group with running [S1]-style markers before each sentence, and each group's id range."""
+    lines, ranges, start = [], [], 1
+    for group in groups:
+        lines.append(" ".join(f"[{prefix}{i}] {s}" for i, s in enumerate(group, start)))
+        ranges.append(range(start, start + len(group)))
+        start += len(group)
+    return lines, ranges
+
+
+def tally_text(n: int, reply: Path, corrections: list[dict], transcript: list[str], output: str) -> str:
+    lines = item_head(n, reply, corrections) + ["", "Transcript:"]
+    for block in transcript:
+        lines += ["", block]
+    return "\n".join(lines + ["", "Output:", "", output]) + "\n"
 
 
 def batch_text(items: list[str]) -> str:
@@ -241,8 +333,8 @@ def batch_text(items: list[str]) -> str:
     return "\n".join([head, *items])
 
 
-def estimate_tokens(text: str, entries: int) -> int:
-    return len(text) // 4 + TOKENS_PER_ENTRY * entries + TOKENS_THINKING
+def estimate_tokens(text: str, reply_tokens: int) -> int:
+    return len(text) // 4 + reply_tokens + TOKENS_THINKING
 
 
 def reply_dir(run: Run, key: dict) -> Path:
@@ -253,18 +345,34 @@ def item_parts(run: Run, case: str) -> tuple[list[dict], list[str], list[str]]:
     return run.corrections(case), split_sentences(run.transcript(case)), split_sentences(run.records[case]["output"])
 
 
-def item(run: Run, key: dict, n: int, case: str) -> tuple[str, int, int]:
-    """Item text with its source and output sentence counts."""
+Validator = Callable[[object], list[str]]
+
+
+def item(run: Run, key: dict, n: int, case: str) -> tuple[str, int, Validator]:
+    """Item text under the key's method, its reply-token allowance and the validator for its reply."""
     corrections, source, output = item_parts(run, case)
-    return item_text(n, reply_dir(run, key) / f"{n}.json", corrections, source, output), len(source), len(output)
+    path = reply_dir(run, key) / f"{n}.json"
+    method = key["method"]
+    if method == "sentence":
+        text = item_text(n, path, corrections, source, output)
+        return text, TOKENS_PER_ENTRY * (len(source) + len(output)), lambda r: validate(r, len(source), len(output))
+    transcript, cleaned = run.transcript(case), run.records[case]["output"]
+    quotes = norm(transcript), norm(cleaned)
+    if method == "direct":
+        text = tally_text(n, path, corrections, numbered(paragraphs(transcript), "S")[0], cleaned.strip())
+        return text, REPLY_TOKENS[method], lambda r: validate_direct(r, len(source), *quotes)
+    parts, ranges = numbered(chunks(transcript), "S")
+    blocks = [f"Part {i}:\n{p}" for i, p in enumerate(parts, 1)]
+    text = tally_text(n, path, corrections, blocks, "\n\n".join(numbered(paragraphs(cleaned), "O")[0]))
+    return text, REPLY_TOKENS[method], lambda r: validate_chunked(r, ranges, len(output), *quotes)
 
 
 def pack(items: list[tuple[int, str, int]]) -> list[list[tuple[int, str]]]:
-    """Group (number, text, entries) items into batches within MAX_ITEMS and MAX_TOKENS."""
+    """Group (number, text, reply tokens) items into batches within MAX_ITEMS and MAX_TOKENS."""
     batches: list[list[tuple[int, str]]] = [[]]
     used = 0
-    for n, text, entries in items:
-        est = estimate_tokens(text, entries)
+    for n, text, reply_tokens in items:
+        est = estimate_tokens(text, reply_tokens)
         if est > MAX_TOKENS:
             raise JudgeError(f"item {n} alone needs ~{est} tokens, over the {MAX_TOKENS} batch ceiling")
         if batches[-1] and (len(batches[-1]) >= MAX_ITEMS or used + est > MAX_TOKENS):
@@ -284,7 +392,7 @@ def write_batches(folder: Path, stem: str, batches: list[list[tuple[int, str]]])
     return paths
 
 
-def prepare(run: Run) -> list[Path]:
+def prepare(run: Run, method: str = "sentence") -> list[Path]:
     key_path = run.judge_dir / "key.json"
     if key_path.exists():
         raise JudgeError(f"already prepared: {run.judge_dir}; trash it and its reply folder to prepare again")
@@ -292,15 +400,16 @@ def prepare(run: Run) -> list[Path]:
     random.SystemRandom().shuffle(cases)
     key = {
         "token": secrets.token_hex(6),
+        "method": method,
         "set_version": run.set_version,
-        "judge_model": judge_model(),
-        "judge_version": judge_version(),
+        "judge_model": judge_model(method),
+        "judge_version": judge_version(method),
         "items": {},
     }
     items = []
     for n, case in enumerate(cases, 1):
-        text, n_source, n_output = item(run, key, n, case)
-        items.append((n, text, n_source + n_output))
+        text, reply_tokens, _ = item(run, key, n, case)
+        items.append((n, text, reply_tokens))
         key["items"][str(n)] = {"case": case, "sha256": sha256(text.encode("utf-8"))}
     batches = pack(items)
     for number, batch in enumerate(batches, 1):
@@ -392,8 +501,119 @@ def validate(reply, n_source: int, n_output: int) -> list[str]:
     return errors
 
 
+def validate_tally(t: dict, ids: range, transcript: str, output: str) -> list[str]:
+    """Errors in the tally fields of a direct reply or a chunked part; ids are the sentences it may name, and
+    transcript and output are normalised with norm for the quote checks."""
+    errors = []
+    texts = {"transcript": transcript, "output": output}
+
+    def ok(value, kind: str) -> bool:
+        if kind == "id":
+            return type(value) is int and value in ids
+        if not isinstance(value, str):
+            return False
+        if kind == "type":
+            return value in FAULT_TYPES
+        return bool(value.strip()) and (kind == "text" or norm(value) in texts[kind])
+
+    noise = t["noise"]
+    if not (isinstance(noise, list) and all(ok(v, "id") for v in noise) and len(set(noise)) == len(noise)):
+        errors.append(f"noise must be distinct sentence ids S{ids.start}..S{ids.stop - 1}: {noise!r}")
+    if type(t["content_sentences"]) is not int or t["content_sentences"] < 0:
+        errors.append(f"bad content_sentences {t['content_sentences']!r}")
+    fillers = t["fillers_left"]
+    if not isinstance(fillers, dict):
+        errors.append("fillers_left: not an object")
+    else:
+        for token, n in fillers.items():
+            if not norm(token) or norm(token) in REGEX_ONLY or type(n) is not int or n < 1:
+                errors.append(f"fillers_left: bad entry {token!r}: {n!r}")
+    for name, fields in TALLY_LISTS.items():
+        entries = t[name]
+        if not isinstance(entries, list):
+            errors.append(f"{name}: not a list")
+            continue
+        for i, e in enumerate(entries, 1):
+            if isinstance(fields, str):
+                if not ok(e, fields):
+                    errors.append(f"{name}[{i}]: {e!r} is not a quote from the {fields}")
+                continue
+            if not isinstance(e, dict) or set(e) != set(fields):
+                errors.append(f"{name}[{i}]: keys must be {sorted(fields)}")
+                continue
+            for field, kind in fields.items():
+                if not ok(e[field], kind):
+                    what = f"not a quote from the {kind}" if kind in texts else "bad"
+                    errors.append(f"{name}[{i}]: {field} {e[field]!r} {what}")
+    if errors:
+        return errors
+    types: dict[int, list[str]] = {}
+    for f in t["faults"]:
+        types.setdefault(f["s"], []).append(f["type"])
+    for s, found in sorted(types.items()):
+        if s in noise:
+            errors.append(f"faults: S{s} is listed as noise")
+        if "dropped" in found and len(found) > 1:
+            errors.append(f"faults: S{s} is dropped, which stands alone")
+        repeated = sorted({k for k in found if k != "clause" and found.count(k) > 1})
+        if repeated:
+            errors.append(f"faults: S{s} repeats {repeated}")
+    return errors
+
+
+def validate_direct(reply, n_source: int, transcript: str, output: str) -> list[str]:
+    """Errors of one direct-method reply; empty when valid."""
+    if not isinstance(reply, dict):
+        return ["reply is not a JSON object"]
+    if set(reply) != TALLY_KEYS:
+        return [f"top-level keys {sorted(reply)} != {sorted(TALLY_KEYS)}"]
+    return validate_tally(reply, range(1, n_source + 1), transcript, output)
+
+
+def validate_chunked(reply, parts: list[range], n_output: int, transcript: str, output: str) -> list[str]:
+    """Errors of one chunked-method reply; parts are the source id ranges of the transcript parts."""
+    if not isinstance(reply, dict):
+        return ["reply is not a JSON object"]
+    if set(reply) != {"parts"}:
+        return [f"top-level keys {sorted(reply)} != ['parts']"]
+    if not isinstance(reply["parts"], list) or len(reply["parts"]) != len(parts):
+        return [f"parts: expected {len(parts)} entries"]
+    errors, spans = [], []
+    for i, (e, ids) in enumerate(zip(reply["parts"], parts), 1):
+        where = f"parts[{i}]"
+        if not isinstance(e, dict) or set(e) != PART_KEYS:
+            errors.append(f"{where}: keys must be {sorted(PART_KEYS)}")
+            continue
+        if type(e["part"]) is not int or e["part"] != i:
+            errors.append(f"{where}: part {e['part']!r} != {i}")
+        span = e["output"]
+        if not isinstance(span, list) or (
+            span
+            and not (len(span) == 2 and all(type(v) is int and 1 <= v <= n_output for v in span) and span[0] <= span[1])
+        ):
+            errors.append(f"{where}: output must be [] or [first, last] within O1..O{n_output}: {span!r}")
+        elif span:
+            spans.append(span)
+        errors += [f"{where}: {x}" for x in validate_tally(e, ids, transcript, output)]
+    if not errors and n_output:
+        gaps = any(not a[1] <= b[0] <= a[1] + 1 for a, b in pairwise(spans))
+        if not spans or spans[0][0] != 1 or spans[-1][1] != n_output or gaps:
+            errors.append(f"output spans must run in order over O1..O{n_output}, sharing at most a boundary sentence")
+    return errors
+
+
+def merge_parts(reply: dict) -> dict:
+    """One direct-method tally summed over a chunked reply's parts."""
+    parts = reply["parts"]
+    fillers: Counter[str] = Counter()
+    for p in parts:
+        fillers.update(p["fillers_left"])
+    merged = {k: [x for p in parts for x in p[k]] for k in ("noise", *TALLY_LISTS)}
+    return merged | {"content_sentences": sum(p["content_sentences"] for p in parts), "fillers_left": dict(fillers)}
+
+
 def check_replies(
-    folder: Path, key: dict, sizes: dict[str, tuple[int, int]]
+    folder: Path, key: dict, validators: dict[str, Validator]
 ) -> tuple[dict[str, dict], dict[str, str]]:
     """Valid replies by case id, and problems by item number."""
     valid, problems = {}, {}
@@ -407,7 +627,7 @@ def check_replies(
         except json.JSONDecodeError as exc:
             problems[n] = f"invalid JSON: {exc}"
             continue
-        errors = validate(reply, *sizes[n])
+        errors = validators[n](reply)
         if errors:
             problems[n] = "invalid: " + "; ".join(errors[:3]) + (f" (+{len(errors) - 3})" if len(errors) > 3 else "")
         else:
@@ -415,11 +635,51 @@ def check_replies(
     return valid, problems
 
 
-def case_metrics(record: dict, reply: dict | None, words: int) -> tuple[dict, dict]:
+def sentence_tally(reply: dict, output: str) -> dict:
+    """Fault counts of a per-sentence reply."""
+    content = [s for s in reply["source"] if s["kind"] == "content"]
+    additions = sum(o["sourced"] == "no" for o in reply["output"])
+    additions += sum(len(o["added"]) for o in reply["output"] if o["sourced"] == "yes")
+    return {
+        "content": len(content),
+        "omitted": sum(s["present"] == "no" for s in content),
+        "distorted": sum(s["present"] == "yes" and any(s[c] == "no" for c in CHECKS) for s in content),
+        "additions": additions,
+        "fillers": filler_count(split_sentences(output), reply["fillers_left"]) + len(reply["stubs_left"]),
+        "wrong_fixes": len(reply["wrong_fixes"]),
+        "missed_fixes": len(reply["missed_fixes"]),
+        "judge_content": None,
+    }
+
+
+def direct_tally(reply: dict, n_source: int, output: str) -> dict:
+    """Fault counts of a direct-method tally; content is the split's sentences minus the judge's noise."""
+    omitted = {f["s"] for f in reply["faults"] if f["type"] in OMISSION_TYPES}
+    distorted = {f["s"] for f in reply["faults"]} - omitted
+    return {
+        "content": n_source - len(reply["noise"]),
+        "omitted": len(omitted),
+        "distorted": len(distorted),
+        "additions": len(reply["added"]),
+        "fillers": tally_fillers(output, reply["fillers_left"]) + len(reply["stubs_left"]),
+        "wrong_fixes": len(reply["wrong_fixes"]),
+        "missed_fixes": len(reply["missed_fixes"]),
+        "judge_content": reply["content_sentences"],
+    }
+
+
+def reply_tally(method: str, reply: dict, n_source: int, output: str) -> dict:
+    if method == "sentence":
+        return sentence_tally(reply, output)
+    return direct_tally(merge_parts(reply) if method == "chunked" else reply, n_source, output)
+
+
+def case_metrics(record: dict, tally: dict | None, words: int) -> tuple[dict, dict]:
     """Per-case metric values and raw fault counts; None where a value does not apply."""
     flags = len(record.get("suspect_lists") or [])
     if record["outcome"] == "other":
         counts = {"kept": 0.0, **dict.fromkeys(("omissions", "distortions", "additions", "fillers", "critical"))}
+        counts |= {"content": None, "judge_content": None}
         return {
             "critical_free": 0.0,
             "kept": 0.0,
@@ -433,17 +693,13 @@ def case_metrics(record: dict, reply: dict | None, words: int) -> tuple[dict, di
             "flags": flags,
             "incomplete": 100.0,
         }, counts
-    assert reply is not None
-    content = [s for s in reply["source"] if s["kind"] == "content"]
-    omitted = sum(s["present"] == "no" for s in content)
-    distorted = sum(s["present"] == "yes" and any(s[c] == "no" for c in CHECKS) for s in content)
-    kept = len(content) - omitted - distorted
-    additions = sum(o["sourced"] == "no" for o in reply["output"])
-    additions += sum(len(o["added"]) for o in reply["output"] if o["sourced"] == "yes")
-    fillers = filler_count(split_sentences(record["output"]), reply["fillers_left"]) + len(reply["stubs_left"])
+    assert tally is not None
+    content, omitted, distorted = tally["content"], tally["omitted"], tally["distorted"]
+    additions, fillers = tally["additions"], tally["fillers"]
+    kept = content - omitted - distorted
 
     def per100(count: int) -> float | None:
-        return 100 * count / len(content) if content else None
+        return 100 * count / content if content else None
 
     critical = omitted + distorted + additions
     counts = {
@@ -453,6 +709,8 @@ def case_metrics(record: dict, reply: dict | None, words: int) -> tuple[dict, di
         "additions": additions,
         "fillers": fillers,
         "critical": critical,
+        "content": content,
+        "judge_content": tally["judge_content"],
     }
     return {
         "critical_free": 0.0 if critical else 100.0,
@@ -462,8 +720,8 @@ def case_metrics(record: dict, reply: dict | None, words: int) -> tuple[dict, di
         "distortions": per100(distorted),
         "additions": float(additions),
         "fillers": 1000 * fillers / words if words else None,
-        "wrong_fixes": float(len(reply["wrong_fixes"])),
-        "missed_fixes": float(len(reply["missed_fixes"])),
+        "wrong_fixes": float(tally["wrong_fixes"]),
+        "missed_fixes": float(tally["missed_fixes"]),
         "flags": float(flags),
         "incomplete": 0.0,
     }, counts
@@ -542,18 +800,30 @@ def git(cwd: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
-def judge_version() -> str:
-    head = git(ROOT, "log", "-1", "--format=%H", "--", *JUDGE_PATHS)[:7] or "none"
-    tracked = git(ROOT, "ls-files", "--", *JUDGE_PATHS).splitlines()
-    dirty = bool(git(ROOT, "status", "--porcelain", "--", *JUDGE_PATHS)) or len(tracked) < len(JUDGE_PATHS)
+def commit_of(paths: tuple[str, ...]) -> str:
+    head = git(ROOT, "log", "-1", "--format=%H", "--", *paths)[:7] or "none"
+    tracked = git(ROOT, "ls-files", "--", *paths).splitlines()
+    dirty = bool(git(ROOT, "status", "--porcelain", "--", *paths)) or len(tracked) < len(paths)
     return head + ("+dirty" if dirty else "")
 
 
-def judge_model() -> str:
-    text = (ROOT / JUDGE_PATHS[0]).read_text(encoding="utf-8")
+def judge_version(method: str) -> str:
+    """Last commit of the method's agent file and this script; any method but sentence is prefixed, "direct abc1234"."""
+    commit = commit_of((AGENTS[method], JUDGE_CODE))
+    return commit if method == "sentence" else f"{method} {commit}"
+
+
+def judge_label(s: dict) -> str:
+    """Results-table judge column: "opus abc1234", or "opus/direct abc1234" for another method."""
+    method, _, commit = s["judge_version"].rpartition(" ")
+    return f"{s['judge_model']}{'/' + method if method else ''} {commit}"
+
+
+def judge_model(method: str) -> str:
+    text = (ROOT / AGENTS[method]).read_text(encoding="utf-8")
     m = re.search(r"^model:\s*(\S+)", text, re.MULTILINE)
     if not m:
-        raise JudgeError(f"no model line in {JUDGE_PATHS[0]}")
+        raise JudgeError(f"no model line in {AGENTS[method]}")
     return m.group(1)
 
 
@@ -584,20 +854,21 @@ def write_scores(path: Path, run_id: str, rows: list[dict]) -> None:
     write_text(path, "".join(f"{ln}\n" for ln in kept + [json.dumps(r) for r in rows]))
 
 
-def score(run: Run, previous: Previous) -> dict:
+def score(run: Run, previous: Previous, method: str = "sentence") -> dict:
     """Score the run into judge/summary.json and print the per-case kept deltas when a comparison row exists."""
     words = {c: len(run.transcript(c).split()) for c in run.cases}
     key = read_json(run.judge_dir / "key.json")
+    if key.get("method") != method:
+        raise JudgeError(f"prepared with --method {key.get('method')}; score with the same method, or prepare again")
     stale = []
     if key["set_version"] != run.set_version:
         stale.append(f"set {key['set_version']} -> {run.set_version}")
-    current_judge = (judge_model(), judge_version())
+    current_judge = (judge_model(method), judge_version(method))
     if (key["judge_model"], key["judge_version"]) != current_judge:
         stale.append(f"judge {key['judge_model']} {key['judge_version']} -> {' '.join(current_judge)}")
-    texts, sizes = {}, {}
+    texts, reply_tokens, validators = {}, {}, {}
     for n, entry in key["items"].items():
-        texts[n], n_source, n_output = item(run, key, int(n), entry["case"])
-        sizes[n] = (n_source, n_output)
+        texts[n], reply_tokens[n], validators[n] = item(run, key, int(n), entry["case"])
     changed = [n for n in texts if sha256(texts[n].encode("utf-8")) != key["items"][n]["sha256"]]
     if changed:
         stale.append(f"inputs of items {', '.join(sorted(changed, key=int))}")
@@ -605,14 +876,14 @@ def score(run: Run, previous: Previous) -> dict:
         raise JudgeError(
             f"changed since prepare: {'; '.join(stale)}; trash {run.judge_dir} and its reply folder and prepare again"
         )
-    replies, problems = check_replies(reply_dir(run, key), key, sizes)
+    replies, problems = check_replies(reply_dir(run, key), key, validators)
     for old in run.judge_dir.glob("retry-*.md"):
         old.unlink()
     if problems:
         for n in sorted(problems, key=int):
             print(f"item {n}: {problems[n]}")
         numbers = sorted(problems, key=int)
-        batches = pack([(int(n), texts[n], sum(sizes[n])) for n in numbers])
+        batches = pack([(int(n), texts[n], reply_tokens[n]) for n in numbers])
         paths = write_batches(run.judge_dir, "retry", batches)
         raise JudgeError(
             f"{len(problems)} of {len(key['items'])} replies missing or invalid; one fresh judge per file: "
@@ -620,7 +891,11 @@ def score(run: Run, previous: Previous) -> dict:
         )
     per_case, counts = {}, {}
     for case in run.cases:
-        per_case[case], counts[case] = case_metrics(run.records[case], replies.get(case), words[case])
+        tally = None
+        if case in replies:
+            n_source = len(split_sentences(run.transcript(case)))
+            tally = reply_tally(method, replies[case], n_source, run.records[case]["output"])
+        per_case[case], counts[case] = case_metrics(run.records[case], tally, words[case])
     bands: dict[str, dict] = {}
     for case, values in per_case.items():
         label = band(words[case]) or "outside bands"
@@ -640,7 +915,14 @@ def score(run: Run, previous: Previous) -> dict:
     }
     write_text(run.judge_dir / "summary.json", json.dumps(summary, indent=2) + "\n")
     rows = [
-        {"run_id": run.id, **run.fields, "case_id": case, "outcome": run.records[case]["outcome"], **counts[case]}
+        {
+            "run_id": run.id,
+            **run.fields,
+            "case_id": case,
+            "method": method,
+            "outcome": run.records[case]["outcome"],
+            **counts[case],
+        }
         for case in run.cases
     ]
     write_scores(run.data / "scores.jsonl", run.id, rows)
@@ -704,7 +986,7 @@ def table_row(s: dict, delta: str) -> list[str]:
         fmt(kept, 1, kept_se), m["critical"], m["omissions"], m["distortions"], m["additions"], m["fillers"],
         m["critical_free"], delta, m["flags"], m["wrong_fixes"], m["missed_fixes"], m["incomplete"],
         fmt(c["tokens"], 0), fmt(c["cost"], 4), fmt(c["seconds"], 1),
-        f"{s['judge_model']} {s['judge_version']}", s["harness"],
+        judge_label(s), s["harness"],
     ]  # fmt: skip
 
 
@@ -743,17 +1025,18 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Judge batches and scoring for the cleaning benchmark.")
     parser.add_argument("command", choices=("prepare", "score"))
     parser.add_argument("--run", required=True, help="run folder name under <data>/runs/")
+    parser.add_argument("--method", choices=tuple(AGENTS), default="sentence", help="judging method")
     parser.add_argument("--data", type=Path, default=DATA, help="data root holding cases/, sets/ and runs/")
     args = parser.parse_args()
     try:
         run = Run(args.data.resolve(), args.run)
         if args.command == "prepare":
             judged = sum(r["outcome"] in JUDGED for r in run.records.values())
-            print(f"{run.id}: {len(run.records)} cases, {judged} to judge")
-            paths = prepare(run)
-            print(f"{len(paths)} batches in {run.judge_dir}")
+            print(f"{run.id}: {len(run.records)} cases, {judged} to judge, method {args.method}")
+            paths = prepare(run, args.method)
+            print(f"{len(paths)} batches in {run.judge_dir} for the {Path(AGENTS[args.method]).stem} agent")
             return 0
-        summary = score(run, previous_prompt)
+        summary = score(run, previous_prompt, args.method)
         m =summary["metrics"]
         print(
             f"{run.id}: critical-free {fmt(m['critical_free'][0], 1)}%, kept {fmt(m['kept'][0], 1, m['kept'][1])}%, "
