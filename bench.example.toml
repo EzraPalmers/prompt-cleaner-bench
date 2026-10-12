@@ -1,0 +1,10 @@
+# Copy to bench.toml (ignored) and fill in your own values.
+
+[extract]
+# Session cwds to accept, as Codex records them in a rollout's first line (compared case-insensitively).
+cwds = [
+    'C:\Users\YOU\path\to\cleaner-folder',
+]
+# Optional inclusive bounds on the session start date, as TOML dates.
+# since = 2026-01-01
+# until = 2026-12-31
