@@ -20,7 +20,7 @@ Usage:
 
 Flags:
   --run RUN_ID  run folder name under <data>/runs/ (<prompt>_<model>_<effort>)
-  --method M    judging method (default sentence): sentence answers every source and output sentence; direct
+  --method M    judging method (default direct): sentence answers every source and output sentence; direct
                 tallies only the faults of a dictation; chunked gives that tally per transcript part. A method other
                 than sentence prefixes the judge version, so its rows never compare with another method's.
   --data DIR    data root holding cases/, sets/ and runs/ (default: the tool's data/); fixture runs use it to stay
@@ -393,7 +393,7 @@ def write_batches(folder: Path, stem: str, batches: list[list[tuple[int, str]]],
     return paths
 
 
-def prepare(run: Run, method: str = "sentence") -> list[Path]:
+def prepare(run: Run, method: str = "direct") -> list[Path]:
     key_path = run.judge_dir / "key.json"
     if key_path.exists():
         key = read_json(key_path)
@@ -661,30 +661,30 @@ def sentence_tally(reply: dict, output: str) -> dict:
         "fillers": filler_count(split_sentences(output), reply["fillers_left"]) + len(reply["stubs_left"]),
         "wrong_fixes": len(reply["wrong_fixes"]),
         "missed_fixes": len(reply["missed_fixes"]),
-        "judge_content": None,
     }
 
 
-def direct_tally(reply: dict, n_source: int, output: str) -> dict:
-    """Fault counts of a direct-method tally; content is the split's sentences minus the judge's noise."""
+def direct_tally(reply: dict, output: str) -> dict:
+    """Fault counts of a direct-method tally; content is the judge's content_sentences."""
+    if "content_sentences" not in reply:
+        raise JudgeError("judging record has no content_sentences")
     omitted = {f["s"] for f in reply["faults"] if f["type"] in OMISSION_TYPES}
     distorted = {f["s"] for f in reply["faults"]} - omitted
     return {
-        "content": n_source - len(reply["noise"]),
+        "content": reply["content_sentences"],
         "omitted": len(omitted),
         "distorted": len(distorted),
         "additions": len(reply["added"]),
         "fillers": tally_fillers(output, reply["fillers_left"]) + len(reply["stubs_left"]),
         "wrong_fixes": len(reply["wrong_fixes"]),
         "missed_fixes": len(reply["missed_fixes"]),
-        "judge_content": reply["content_sentences"],
     }
 
 
-def reply_tally(method: str, reply: dict, n_source: int, output: str) -> dict:
+def reply_tally(method: str, reply: dict, output: str) -> dict:
     if method == "sentence":
         return sentence_tally(reply, output)
-    return direct_tally(merge_parts(reply) if method == "chunked" else reply, n_source, output)
+    return direct_tally(merge_parts(reply) if method == "chunked" else reply, output)
 
 
 def case_metrics(record: dict, tally: dict | None, words: int) -> tuple[dict, dict]:
@@ -692,7 +692,7 @@ def case_metrics(record: dict, tally: dict | None, words: int) -> tuple[dict, di
     flags = len(record.get("suspect_lists") or [])
     if record["outcome"] == "other":
         counts = {"kept": 0.0, **dict.fromkeys(("omissions", "distortions", "additions", "fillers", "critical"))}
-        counts |= {"content": None, "judge_content": None}
+        counts["content"] = None
         return {
             "critical_free": 0.0,
             "kept": 0.0,
@@ -723,7 +723,6 @@ def case_metrics(record: dict, tally: dict | None, words: int) -> tuple[dict, di
         "fillers": fillers,
         "critical": critical,
         "content": content,
-        "judge_content": tally["judge_content"],
     }
     return {
         "critical_free": 0.0 if critical else 100.0,
@@ -882,7 +881,7 @@ def view(run: Run, per_case: dict[str, dict], words: dict[str, int], cases: list
     }
 
 
-def score(run: Run, previous: Previous, method: str = "sentence") -> dict:
+def score(run: Run, previous: Previous, method: str = "direct") -> dict:
     """Score the run into judge/summary.json and print the per-case kept deltas when a comparison row exists."""
     words = {c: len(run.transcript(c).split()) for c in run.cases}
     key = read_json(run.judge_dir / "key.json")
@@ -924,8 +923,7 @@ def score(run: Run, previous: Previous, method: str = "sentence") -> dict:
     for case in run.cases:
         tally = None
         if case in replies:
-            n_source = len(split_sentences(run.transcript(case)))
-            tally = reply_tally(method, replies[case], n_source, run.records[case]["output"])
+            tally = reply_tally(method, replies[case], run.records[case]["output"])
         per_case[case], counts[case] = case_metrics(run.records[case], tally, words[case])
     quick = list(run.inputs)[:DEFAULT_N]
     summary = {
@@ -1061,7 +1059,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Judge batches and scoring for the cleaning benchmark.")
     parser.add_argument("command", choices=("prepare", "score"))
     parser.add_argument("--run", required=True, help="run folder name under <data>/runs/")
-    parser.add_argument("--method", choices=tuple(AGENTS), default="sentence", help="judging method")
+    parser.add_argument("--method", choices=tuple(AGENTS), default="direct", help="judging method (default direct)")
     parser.add_argument("--data", type=Path, default=DATA, help="data root holding cases/, sets/ and runs/")
     args = parser.parse_args()
     try:

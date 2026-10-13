@@ -139,13 +139,13 @@ def test_prepare_again_batches_only_cases_without_a_verdict(data, monkeypatch):
     cases.write_text("\n".join(CASES[:2]) + "\n", encoding="utf-8")
     run = Run(data, RUN_ID)
     assert run.cases == CASES[:2]
-    assert [p.name for p in judge.prepare(run)] == ["batch-01.md"]
+    assert [p.name for p in judge.prepare(run, "sentence")] == ["batch-01.md"]
     answer_all(run)
     with pytest.raises(JudgeError, match="nothing new"):
-        judge.prepare(run)
+        judge.prepare(run, "sentence")
     cases.write_text("\n".join(CASES) + "\n", encoding="utf-8")
     run = Run(data, RUN_ID)
-    paths = judge.prepare(run)
+    paths = judge.prepare(run, "sentence")
     assert [p.name for p in paths] == ["batch-02.md"]
     assert paths[0].read_text(encoding="utf-8").count("## Item") == 2
     key = json.loads((run.judge_dir / "key.json").read_text())
@@ -153,26 +153,26 @@ def test_prepare_again_batches_only_cases_without_a_verdict(data, monkeypatch):
     assert sorted(e["case"] for e in key["items"].values()) == CASES
     assert [key["items"][n]["batch"] for n in "1234"] == [1, 1, 2, 2]
     answer_all(run)
-    assert judge.score(run, NONE)["n_cases"] == 4
+    assert judge.score(run, NONE, "sentence")["n_cases"] == 4
 
 
 def test_score_refuses_judged_cases_without_a_verdict(data):
     cases = data / "sets" / "cases.txt"
     cases.write_text("\n".join(CASES[:2]) + "\n", encoding="utf-8")
     run = Run(data, RUN_ID)
-    judge.prepare(run)
+    judge.prepare(run, "sentence")
     cases.write_text("\n".join(CASES) + "\n", encoding="utf-8")
     with pytest.raises(JudgeError, match="2 judged case.*prepare again"):
-        judge.score(Run(data, RUN_ID), NONE)
+        judge.score(Run(data, RUN_ID), NONE, "sentence")
 
 
 def test_quick_row_is_the_first_cases_of_the_list_and_full_row_all(data, monkeypatch):
     monkeypatch.setattr(judge, "DEFAULT_N", 2)
     run = Run(data, RUN_ID)
-    judge.prepare(run)
+    judge.prepare(run, "sentence")
     answer_all(run, lambda case, r: r["source"][0].update(present="no", missing=["a clause"]) or r
                if case == CASES[3] else r)
-    summary = judge.score(run, NONE)
+    summary = judge.score(run, NONE, "sentence")
     assert summary["n_cases"] == 4 and summary["quick"]["n_cases"] == 2
     assert set(summary["quick"]["per_case"]) == set(CASES[:2])
     assert summary["quick"]["metrics"]["kept"][0] == 100.0 and summary["metrics"]["kept"][0] < 100.0
@@ -183,13 +183,13 @@ def test_quick_row_is_the_first_cases_of_the_list_and_full_row_all(data, monkeyp
 
 def test_batches_split_at_item_limit(data, monkeypatch):
     monkeypatch.setattr(judge, "MAX_ITEMS", 3)
-    assert len(judge.prepare(Run(data, RUN_ID))) == 2
+    assert len(judge.prepare(Run(data, RUN_ID), "sentence")) == 2
 
 
 def test_item_over_token_ceiling_is_refused(data, monkeypatch):
     monkeypatch.setattr(judge, "MAX_TOKENS", 1_000)
     with pytest.raises(JudgeError, match="alone needs"):
-        judge.prepare(Run(data, RUN_ID))
+        judge.prepare(Run(data, RUN_ID), "sentence")
 
 
 def test_cases_without_a_record_are_left_out_and_a_failed_record_blocks_the_run(data):
@@ -224,32 +224,32 @@ def test_record_without_required_fields_blocks_the_run(data):
 
 def test_inputs_or_judge_changed_since_prepare_are_refused(data, monkeypatch):
     run = Run(data, RUN_ID)
-    judge.prepare(run)
+    judge.prepare(run, "sentence")
     original = run.records[CASES[1]]["output"]
     edit_record(data, CASES[1], output="Paint it red. Then paint it blue.")
     run = Run(data, RUN_ID)
     answer_all(run)
     with pytest.raises(JudgeError, match="inputs of items"):
-        judge.score(run, NONE)
+        judge.score(run, NONE, "sentence")
     edit_record(data, CASES[1], output=original)
     run = Run(data, RUN_ID)
     answer_all(run)
     monkeypatch.setattr(judge, "commit_of", lambda paths: "def5678")
     with pytest.raises(JudgeError, match="judge opus abc1234 -> opus def5678"):
-        judge.score(run, NONE)
+        judge.score(run, NONE, "sentence")
 
 
 def test_missing_reply_is_listed_then_scored_and_row_replaced(data):
     run = Run(data, RUN_ID)
-    judge.prepare(run)
+    judge.prepare(run, "sentence")
     answer_all(run)
     key = json.loads((run.judge_dir / "key.json").read_text())
     (judge.reply_dir(run, key) / "2.json").unlink()
     with pytest.raises(JudgeError, match="1 of 4 replies"):
-        judge.score(run, NONE)
+        judge.score(run, NONE, "sentence")
     assert (run.judge_dir / "retry-01.md").read_text(encoding="utf-8").count("## Item 2\n") == 1
     answer_all(run)
-    summary = judge.score(run, NONE)
+    summary = judge.score(run, NONE, "sentence")
     assert not list(run.judge_dir.glob("retry-*.md"))
     assert summary["metrics"]["kept"][0] == 100.0
     assert summary["judge_version"] == "abc1234"
@@ -269,9 +269,9 @@ def test_missing_reply_is_listed_then_scored_and_row_replaced(data):
 def test_retries_are_bounded_like_batches(data, monkeypatch):
     monkeypatch.setattr(judge, "MAX_ITEMS", 3)
     run = Run(data, RUN_ID)
-    judge.prepare(run)
+    judge.prepare(run, "sentence")
     with pytest.raises(JudgeError, match="4 of 4 replies"):
-        judge.score(run, NONE)
+        judge.score(run, NONE, "sentence")
     retries = sorted(run.judge_dir.glob("retry-*.md"))
     assert [p.read_text(encoding="utf-8").count("## Item") for p in retries] == [3, 1]
 
@@ -279,7 +279,7 @@ def test_retries_are_bounded_like_batches(data, monkeypatch):
 def test_other_call_scores_as_all_absent_and_incomplete(data):
     edit_record(data, CASES[0], outcome="other", output=None)
     run = Run(data, RUN_ID)
-    judge.prepare(run)
+    judge.prepare(run, "sentence")
     assert len(json.loads((run.judge_dir / "key.json").read_text())["items"]) == 3
 
     def drop_first(case, r):
@@ -288,7 +288,7 @@ def test_other_call_scores_as_all_absent_and_incomplete(data):
         return r
 
     answer_all(run, drop_first)
-    m = judge.score(run, NONE)["metrics"]
+    m = judge.score(run, NONE, "sentence")["metrics"]
     # four cases: other (kept 0, omissions 100), one omission in eight, two perfect
     assert m["kept"][0] == pytest.approx((0 + 87.5 + 100 + 100) / 4)
     assert m["omissions"][0] == pytest.approx((100 + 12.5) / 4)
@@ -302,10 +302,10 @@ def test_scores_file_has_one_line_per_case_replaced_on_rerun(data):
     scores = data / "scores.jsonl"
     scores.write_text(json.dumps({"run_id": "other-run", "case_id": "x"}) + "\n", encoding="utf-8")
     run = Run(data, RUN_ID)
-    judge.prepare(run)
+    judge.prepare(run, "sentence")
     answer_all(run, lambda case, r: r["source"][0].update(present="no", missing=["a clause"]) or r)
-    judge.score(run, NONE)
-    judge.score(run, NONE)
+    judge.score(run, NONE, "sentence")
+    judge.score(run, NONE, "sentence")
     lines = [json.loads(ln) for ln in scores.read_text(encoding="utf-8").splitlines()]
     assert [ln["run_id"] for ln in lines] == ["other-run"] + [RUN_ID] * 4
     row = lines[1]
@@ -313,23 +313,23 @@ def test_scores_file_has_one_line_per_case_replaced_on_rerun(data):
         "run_id": RUN_ID, "prompt": "a1b2c3d", "model": "gpt-6-luna", "effort": "high",
         "dictionary": "off", "case_id": row["case_id"], "method": "sentence", "outcome": row["outcome"],
         "kept": row["kept"], "omissions": 1, "distortions": 0, "additions": 0, "fillers": row["fillers"],
-        "critical": 1, "content": 8, "judge_content": None,
+        "critical": 1, "content": 8,
     }  # fmt: skip
     assert row["kept"] < 100 and isinstance(row["fillers"], int)
 
 
 def test_score_prints_per_case_deltas_against_the_comparison_row(data, capsys):
     run = Run(data, RUN_ID)
-    judge.prepare(run)
+    judge.prepare(run, "sentence")
     answer_all(run)
-    summary = judge.score(run, NONE)
+    summary = judge.score(run, NONE, "sentence")
     assert "delta kept" not in capsys.readouterr().out
     prior = json.loads(json.dumps(summary)) | {"prompt": "0000000"}
     prior["per_case"][CASES[0]]["kept"] = 75.0
     prior_dir = data / "runs" / "0000000_gpt-6-luna_high" / "judge"
     prior_dir.mkdir(parents=True)
     (prior_dir / "summary.json").write_text(json.dumps(prior), encoding="utf-8")
-    judge.score(run, {"a1b2c3d": "0000000"}.get)
+    judge.score(run, {"a1b2c3d": "0000000"}.get, "sentence")
     out = capsys.readouterr().out
     assert "delta kept 6.2 (6.2) vs 0000000" in out
     assert f"  {CASES[0]}  +25.0" in out and f"  {CASES[1]}  +0.0" in out
@@ -409,20 +409,33 @@ def test_tally_methods_score_and_record_the_method(data, method):
     assert ("Part 1:\n[S1]" in text and "[O1] I want" in text) if method == "chunked" else "[O1]" not in text
     answer_tallies(run, method)
     with pytest.raises(JudgeError, match="prepared with --method"):
-        judge.score(run, NONE)
+        judge.score(run, NONE, "sentence")
     m = judge.score(run, NONE, method)["metrics"]
-    # one dropped, one clause, one hedge, one addition, each in a different case of eight content sentences
-    assert m["kept"][0] == pytest.approx((87.5 + 87.5 + 87.5 + 100) / 4)
-    assert m["omissions"][0] == pytest.approx(25 / 4)
+    # one dropped (in a case the judge counts 7 content sentences), one clause, one hedge, one addition
+    assert m["kept"][0] == pytest.approx((600 / 7 + 87.5 + 87.5 + 100) / 4)
+    assert m["omissions"][0] == pytest.approx((100 / 7 + 12.5) / 4)
     assert m["distortions"][0] == pytest.approx(12.5 / 4)
     assert m["additions"][0] == 0.25 and m["critical_free"][0] == 0.0
     rows = {r["case_id"]: r for r in map(json.loads, scores.read_text(encoding="utf-8").splitlines())}
     assert {r["method"] for r in rows.values()} == {method}
-    first = rows[CASES[0]]  # kept over the split's 8 sentences, not the judge's 7
-    assert (first["kept"], first["content"], first["judge_content"], first["omissions"]) == (87.5, 8, 7, 1)
+    first = rows[CASES[0]]  # kept over the judge's 7 content sentences, not the split's 8
+    assert (first["content"], first["omissions"]) == (7, 1)
+    assert first["kept"] == pytest.approx(600 / 7) and "judge_content" not in first
     assert rows[CASES[3]]["fillers"] == 0  # the judge's "so" does not occur in the output
     judge.regenerate(data, NONE)
     assert f"| opus/{method} abc1234 |" in judge.RESULTS.read_text(encoding="utf-8")
+
+
+def test_method_defaults_to_direct(data):
+    run = Run(data, RUN_ID)
+    judge.prepare(run)
+    assert json.loads((run.judge_dir / "key.json").read_text())["method"] == "direct"
+
+
+def test_direct_tally_without_content_sentences_is_refused():
+    reply = {k: v for k, v in tally().items() if k != "content_sentences"}
+    with pytest.raises(JudgeError, match="no content_sentences"):
+        judge.direct_tally(reply, "Paint it.")
 
 
 def test_invalid_tally_reply_is_listed_for_retry(data):
