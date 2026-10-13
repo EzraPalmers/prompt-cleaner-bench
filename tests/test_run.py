@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import json
 import subprocess
 import sys
@@ -87,7 +88,7 @@ def root(tmp_path, monkeypatch):
             (folder / "exchange.txt").write_text("--- assistant ---\n")
             (folder / "resolution.json").write_text(json.dumps(resolution))
     (data / "sets").mkdir()
-    (data / "sets" / "dev.txt").write_text("c-list\nc-clean\n")
+    (data / "sets" / "cases.txt").write_text("c-list\nc-clean\n")
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "home"))
     return root
 
@@ -101,7 +102,7 @@ def fake(tmp_path, monkeypatch, script):
 
 
 def args(**kw):
-    base = {"set": "dev", "model": "m-1", "effort": "low", "prompt": "HEAD", "dictionary": False,
+    base = {"n": 2, "model": "m-1", "effort": "low", "prompt": "HEAD", "dictionary": False,
             "timeout": 30.0}  # fmt: skip
     return argparse.Namespace(**{**base, **kw})
 
@@ -138,9 +139,10 @@ def test_run_records_skip_and_refuse(root, tmp_path, monkeypatch, capsys):
     assert run(args(), root, codex) == 0
 
     run_dir = next((root / "data" / "runs").iterdir())
-    assert run_dir.name.endswith("_m-1_low_dev_off")
+    assert run_dir.name.endswith("_m-1_low") and run_dir.name.count("_") == 2
     listed = json.loads((run_dir / "c-list.json").read_text())
     assert all(k in listed for k in RECORD_FIELDS)
+    assert listed["dictionary"] is None
     assert listed["outcome"] == "suspect-then-clean" and listed["output"] == "Cleaned words."
     assert listed["replies"] == ["1. pie chart"] and listed["unmatched"] == ["blue moose"]
     assert listed["input_tokens"] == 250 and listed["turn_usage"][1]["input_tokens"] == 150
@@ -158,18 +160,33 @@ def test_run_records_skip_and_refuse(root, tmp_path, monkeypatch, capsys):
     assert run(args(), root, codex) == 0
     assert json.loads(state.read_text())["done"] == 3
 
-    (root / "data" / "cases" / "c-clean" / "transcript.txt").write_text("changed")
-    with pytest.raises(RunError, match=r"set_version \("):
-        run(args(), root, codex)
+    (root / "cleaner" / "dictionary.md").write_text("pie shard -> pie chart\n")
+    with pytest.raises(RunError, match="has dictionary None but this run has"):
+        run(args(dictionary=True), root, codex)
+
+
+def test_dictionary_hash_is_recorded_and_a_larger_n_runs_only_new_cases(root, tmp_path, monkeypatch):
+    (root / "cleaner" / "dictionary.md").write_bytes(b"pie shard -> pie chart\n")
+    expected = hashlib.sha256(b"pie shard -> pie chart\n").hexdigest()[:6]
+    _, codex = fake(tmp_path, monkeypatch, [{"events": turn(CLEAN, usage(5))}, {"events": turn(CLEAN, usage(6))}])
+    assert run(args(n=1, dictionary=True), root, codex) == 0
+    run_dir = next((root / "data" / "runs").iterdir())
+    assert not (run_dir / "c-clean.json").exists()
+    assert json.loads((run_dir / "c-list.json").read_text())["dictionary"] == expected
+    assert "dictionary" not in json.loads((run_dir / "spec.json").read_text())
+    assert run(args(n=2, dictionary=True), root, codex) == 0
+    assert json.loads((run_dir / "c-clean.json").read_text())["dictionary"] == expected
+    with pytest.raises(RunError, match="--n must be 1 to 2"):
+        run(args(n=3), root, codex)
 
 
 def test_failed_call_is_rerun(root, tmp_path, monkeypatch):
-    (root / "data" / "sets" / "dev.txt").write_text("c-clean\n")
+    (root / "data" / "sets" / "cases.txt").write_text("c-clean\n")
     _, codex = fake(tmp_path, monkeypatch, [{"events": [], "exit": 3}, {"events": turn(CLEAN, usage(5))}])
-    assert run(args(), root, codex) == 1
+    assert run(args(n=1), root, codex) == 1
     record = json.loads(next((root / "data" / "runs").glob("*/c-clean.json")).read_text())
     assert record["outcome"] == "failed" and record["error"].startswith("exit 3")
-    assert run(args(), root, codex) == 0
+    assert run(args(n=1), root, codex) == 0
 
 
 def test_exchange_without_resolution_fails_fast(root, tmp_path, monkeypatch):
@@ -180,11 +197,11 @@ def test_exchange_without_resolution_fails_fast(root, tmp_path, monkeypatch):
 
 
 def test_fourth_list_is_other_and_counts_its_phrases(root, tmp_path, monkeypatch):
-    (root / "data" / "sets" / "dev.txt").write_text("c-list\n")
+    (root / "data" / "sets" / "cases.txt").write_text("c-list\n")
     first = "Suspect transcription issues:\n\n1. The **pie shard** again."
     script = [{"events": turn(first, usage(10 * n))} for n in (1, 2, 3)] + [{"events": turn(LIST, usage(40))}]
     _, codex = fake(tmp_path, monkeypatch, script)
-    assert run(args(), root, codex) == 0
+    assert run(args(n=1), root, codex) == 0
     record = json.loads(next((root / "data" / "runs").glob("*/c-list.json")).read_text())
     assert record["outcome"] == "other" and len(record["replies"]) == 3 and record["unmatched"] == ["blue moose"]
 
@@ -194,9 +211,9 @@ def test_list_with_prose_is_other_and_not_answered(root, tmp_path, monkeypatch):
              '"Then the blue moose left." I guess bold only moose.\nMaybe no issue at all? Let\'s list it.')  # fmt: skip
     assert parse_list(prose) is None
     assert parse_list(LIST + "\nI think that covers it.") is None
-    (root / "data" / "sets" / "dev.txt").write_text("c-list\n")
+    (root / "data" / "sets" / "cases.txt").write_text("c-list\n")
     state, codex = fake(tmp_path, monkeypatch, [{"events": turn(prose, usage(10))}])
-    assert run(args(), root, codex) == 0
+    assert run(args(n=1), root, codex) == 0
     record = json.loads(next((root / "data" / "runs").glob("*/c-list.json")).read_text())
     assert record["outcome"] == "other" and record["unmatched"] == [] and record["replies"] == []
     assert json.loads(state.read_text())["done"] == 1

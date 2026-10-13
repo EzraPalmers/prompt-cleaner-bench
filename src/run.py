@@ -1,9 +1,9 @@
-"""Runs a frozen case set through the cleaner prompt with `codex exec`, one subprocess per call (design section 4).
+"""Runs the first N cases of the master list through the cleaner prompt with `codex exec`, one subprocess per call.
 
-    uv run python src/run.py --set quick --model gpt-6-luna --effort high
-    uv run python src/run.py --set full --model gpt-6-sol --effort low --prompt a1b2c3d --dictionary
+    uv run python src/run.py --model gpt-6-luna --effort high
+    uv run python src/run.py --n 30 --model gpt-6-sol --effort low --prompt a1b2c3d --dictionary
 
---set NAME         cases from data/sets/NAME.txt, one case id per line (quick, full, or a small dev set)
+--n N              the first N case ids of data/sets/cases.txt (default 10, the quick row; all of it is the full row)
 --model SLUG       model passed to every call, and recorded as the call's model
 --effort LEVEL     reasoning effort passed to every call
 --prompt REV|PATH  cleaner commit whose AGENTS.md is staged (default HEAD), or a prompt file (run label file-<sha8>)
@@ -11,8 +11,10 @@
 --timeout SEC      limit per codex subprocess (default 600); a timeout or non-zero exit makes the call failed
 
 One call per case. Writes the call cwd data/stage/<run_id>/ and data/runs/<run_id>/: spec.json, then
-<case_id>.json per case.
-A rerun skips complete records (failed ones run again) and refuses when spec.json differs, naming the fields.
+<case_id>.json per case. The run_id is <prompt label>_<model>_<effort>; each record's `dictionary` is the first six hex
+characters of the dictionary file's sha256 when --dictionary was on, else null.
+A rerun skips complete records (failed ones run again), so a larger --n runs only the new cases. It refuses when
+spec.json differs, naming the fields, or when a record in the folder has a different dictionary value.
 Exit 0 when every call has a record that is not failed; 1 otherwise or on an input error.
 """
 
@@ -36,8 +38,10 @@ from config import ROOT
 COUNTS = ("input_tokens", "cached_input_tokens", "cache_write_input_tokens", "output_tokens", "reasoning_output_tokens")
 RECORD_FIELDS = (
     "output", "suspect_lists", "replies", "unmatched", "outcome", *COUNTS,
-    "seconds", "model", "effort", "codex_version", "session_id", "started",
+    "seconds", "model", "effort", "codex_version", "session_id", "started", "dictionary",
 )  # fmt: skip
+DEFAULT_N = 10
+DICT_CHARS = 6
 LIST_HEAD = "Suspect transcription issues:"
 NONE_NEEDED = "None of these need correcting."
 MAX_LISTS = 3
@@ -104,16 +108,18 @@ def load_resolution(path: Path, raw: bytes) -> dict:
     return resolution
 
 
-def load_set(data: Path, name: str) -> tuple[list[Case], str]:
-    """Cases of data/sets/<name>.txt and the set version <name>@<sha6> over ids, transcripts and resolutions."""
-    path = data / "sets" / f"{name}.txt"
+def load_cases(data: Path, n: int | None = None) -> list[Case]:
+    """The first n cases of data/sets/cases.txt in list order (all of them when n is None)."""
+    path = data / "sets" / "cases.txt"
     if not path.is_file():
-        raise RunError(f"set not found: {path}")
+        raise RunError(f"case list not found: {path}")
     ids = [s for line in path.read_text(encoding="utf-8").splitlines() if (s := line.strip())]
-    if not ids:
-        raise RunError(f"empty set: {path}")
     if len(set(ids)) != len(ids):
         raise RunError(f"duplicate case ids in {path}")
+    if n is not None:
+        if not 1 <= n <= len(ids):
+            raise RunError(f"--n must be 1 to {len(ids)}, got {n}")
+        ids = ids[:n]
     words: dict[str, int] = {}
     manifest = data / "manifest.jsonl"
     if manifest.is_file():
@@ -121,7 +127,7 @@ def load_set(data: Path, name: str) -> tuple[list[Case], str]:
             if line.strip():
                 row = json.loads(line)
                 words[row["case_id"]] = row["words"]
-    cases, digest = [], []
+    cases = []
     for case_id in ids:
         folder = data / "cases" / case_id
         transcript = folder / "transcript.txt"
@@ -134,8 +140,7 @@ def load_set(data: Path, name: str) -> tuple[list[Case], str]:
         r_bytes = resolution.read_bytes() if resolution.is_file() else None
         parsed = load_resolution(resolution, r_bytes) if r_bytes is not None else None
         cases.append(Case(case_id, t_bytes.decode("utf-8"), parsed, words.get(case_id)))
-        digest.append(f"{case_id} {sha256(t_bytes)} {sha256(r_bytes) if r_bytes is not None else '-'}\n")
-    return cases, f"{name}@{sha256(''.join(sorted(digest)).encode())[:6]}"
+    return cases
 
 
 def load_prompt(cleaner: Path, prompt: str) -> Prompt:
@@ -385,12 +390,12 @@ def codex_version(codex: list[str]) -> str:
 
 def run(args: argparse.Namespace, root: Path, codex: list[str]) -> int:
     data, cleaner = root / "data", root / "cleaner"
-    for name, value in (("set", args.set), ("model", args.model), ("effort", args.effort)):
+    for name, value in (("model", args.model), ("effort", args.effort)):
         if not SLUG.fullmatch(value):
             raise RunError(f"--{name} must match {SLUG.pattern}, got {value!r}")
     home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").resolve()
     print(f"codex home {home}")
-    cases, set_version = load_set(data, args.set)
+    cases = load_cases(data, args.n)
     prompt = load_prompt(cleaner, args.prompt)
     dictionary = None
     if args.dictionary:
@@ -399,20 +404,24 @@ def run(args: argparse.Namespace, root: Path, codex: list[str]) -> int:
             raise RunError(f"--dictionary: missing {dict_path}")
         dictionary = dict_path.read_bytes()
     version = codex_version(codex)
-    dict_hash = sha256(dictionary) if dictionary is not None else None
+    dict_id = sha256(dictionary)[:DICT_CHARS] if dictionary is not None else None
     spec = {
         "prompt": prompt.label,
         "prompt_sha256": sha256(prompt.text),
         "developer_sha256": sha256(prompt.developer.encode("utf-8")),
-        "dictionary": dict_hash or "off",
-        "set_version": set_version,
         "codex_version": version,
         "codex_home": str(home),
         "harness": harness(root),
     }
-    run_id = f"{prompt.label}_{args.model}_{args.effort}_{args.set}_{f'd{dict_hash[:6]}' if dict_hash else 'off'}"
+    run_id = f"{prompt.label}_{args.model}_{args.effort}"
     run_dir = data / "runs" / run_id
     check_spec(run_dir / "spec.json", spec)
+    for path in sorted(run_dir.glob("*.json")):
+        if path.name != "spec.json" and (old := json.loads(path.read_text(encoding="utf-8")).get("dictionary")) != dict_id:
+            raise RunError(
+                f"{path} has dictionary {old!r} but this run has {dict_id!r}; move {run_dir} to the trash "
+                "before rerunning with a different dictionary state"
+            )
 
     stage = data / "stage" / run_id
     (stage / ".git").mkdir(parents=True, exist_ok=True)
@@ -427,7 +436,7 @@ def run(args: argparse.Namespace, root: Path, codex: list[str]) -> int:
         if not (run_dir / "spec.json").is_file():
             run_dir.mkdir(parents=True, exist_ok=True)
             write_json(run_dir / "spec.json", spec)
-        record = run_call(case, codex, stage, prompt, args, version)
+        record = run_call(case, codex, stage, prompt, args, version) | {"dictionary": dict_id}
         write_json(run_dir / f"{case.case_id}.json", record)
         print(f" {record['outcome']} {record['seconds']:.1f} s")
         if record.get("error"):
@@ -453,8 +462,8 @@ def run(args: argparse.Namespace, root: Path, codex: list[str]) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Run a case set through the cleaner prompt with codex exec.")
-    parser.add_argument("--set", required=True, help="data/sets/NAME.txt")
+    parser = argparse.ArgumentParser(description="Run the first N cases through the cleaner prompt with codex exec.")
+    parser.add_argument("--n", type=int, default=DEFAULT_N, help="first N cases of data/sets/cases.txt (default 10)")
     parser.add_argument("--model", required=True)
     parser.add_argument("--effort", required=True)
     parser.add_argument("--prompt", default="HEAD", help="cleaner rev or prompt file (default HEAD)")

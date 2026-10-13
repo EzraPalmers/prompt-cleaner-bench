@@ -2,9 +2,6 @@
   "prompt": "a1b2c3d",
   "prompt_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
   "developer_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
-  "dictionary": "off",
-  "set": "quick",
-  "set_version": "quick@2f95c0",
   "codex_version": "0.162.1",
   "codex_home": "~/.codex",
   "harness": "b2c3d4e"

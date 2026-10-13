@@ -23,7 +23,8 @@ data/                    ignored; everything private
 ```
 
 Load the `bench` skill to extract, run, judge or add a results row, and the `mine` skill for resolutions, mining and
-the dictionary. The case sets are quick (10 cases) and full (30), one output per case, no repeats.
+the dictionary. The cases are one ordered list, `data/sets/cases.txt`: the quick row is the first 10, the full row is all of it (30
+now, 50 later), one output per case, no repeats.
 
 ## Warnings
 

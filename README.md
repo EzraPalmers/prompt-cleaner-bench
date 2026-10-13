@@ -57,7 +57,9 @@ Run everything from this repository's root.
    ```
 
 3. Run the cleaner over a case set and judge the outputs (coming: `src/run.py`, `src/judge.py` and the `bench` skill).
-   The sets are quick (10 cases) and full (30), with one output per case and no repeats.
+   The cases are one ordered list, `data/sets/cases.txt`; `run.py --n N` runs the first N (default 10). The quick row
+   of the results is the first 10, the full row is all of it (30 now, 50 later), with one output per case and no
+   repeats.
 4. Read the scores in `outputs/results.md` (coming), one row per prompt version, model, effort level and dictionary
    state.
 5. Mine a dictionary: in Claude Code at this root, ask for the `mine` skill. It reads your correction exchanges, finds

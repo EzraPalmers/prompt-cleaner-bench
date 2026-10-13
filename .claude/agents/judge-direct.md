@@ -7,6 +7,8 @@ effort: medium
 omitClaudeMd: true
 ---
 
+<!-- The notes repository (voice-prompt-cleaner) holds a copy of this file that must be kept identical, because the orchestrator spawns the judge from there. -->
+
 You judge how faithfully a cleaned text keeps what a speaker dictated. A cleaner received a speech-to-text transcript
 and was meant to return the same message with the speech noise removed: fillers, false starts, stutters, accidental
 repeats and the abandoned half of a self-correction go; every instruction, question, hedge, detail and afterthought

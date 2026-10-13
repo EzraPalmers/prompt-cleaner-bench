@@ -28,8 +28,8 @@ instructions; read it only to edit it.
    cases already on disk, and cases whose log is gone (kept, marked `missing_log`). An `error:` line means nothing was
    written; report it, never edit files under `data/cases/` to get past it.
 
-Sets are `data/sets/<name>.txt`, one case id per line: `quick` (10 cases) and `full` (30, the quick ten plus 20). A
-run makes one output per case; there are no repeats.
+Cases are listed in `data/sets/cases.txt`, one case id per line, in run order. The first ten are the quick set, and
+`--n N` runs the first N. A run makes one output per case; there are no repeats.
 
 ## 2. Run a cell
 
@@ -37,16 +37,16 @@ A run measures a committed prompt. The user commits the `cleaner/AGENTS.md` chan
 `HEAD`. `--prompt PATH` scores a prompt file while the cleaner working tree is being edited.
 
 ```
-uv run python src/run.py --set quick --model MODEL --effort LEVEL
+uv run python src/run.py --n 10 --model MODEL --effort LEVEL
 ```
 
-Flags, all that exist: `--set NAME`, `--model SLUG`, `--effort LEVEL`, `--prompt REV|PATH` (default `HEAD`; a file
+Flags, all that exist: `--n N`, `--model SLUG`, `--effort LEVEL`, `--prompt REV|PATH` (default `HEAD`; a file
 path labels the run `file-<sha8>`), `--dictionary` (stage
-`cleaner/dictionary.md`; the run id and the results dictionary column then show `d` and the dictionary hash, such as
-`d5ad724`, never "on"), `--timeout SEC` (per call, default 600).
+`cleaner/dictionary.md`; each record's `dictionary` field then holds the six-hex-char hash, such as `5ad724`, or null
+when off), `--timeout SEC` (per call, default 600).
 
-- The run id starts the line `<run_id>: N cases, D done, T to run` printed at start: `<prompt>_<model>_<effort>_<set>_<dictionary>`, for example
-  `a1b2c3d_gpt-6-luna_high_quick_off`. Results land in `data/runs/<run_id>/`.
+- The run id starts the line `<run_id>: N cases, D done, T to run` printed at start: `<prompt>_<model>_<effort>`, for example
+  `a1b2c3d_gpt-6-luna_high`. Results land in `data/runs/<run_id>/`.
 - Resumable: rerunning the same command skips complete records and retries failed ones. Exit 1 means a call failed
   or an input error; rerun until the summary shows every record and no `failed`.
 - A changed spec (prompt text, developer line, dictionary, set, Codex version or home, harness) is refused
@@ -56,14 +56,14 @@ path labels the run `file-<sha8>`), `--dictionary` (stage
   on; each may be a real mishearing to add to a resolution (the `mine` skill), which changes the set version.
 - Quick run (about ten calls, about 500 s at high): run it in the foreground with a 600000 ms tool timeout. A run cut
   off by a timeout is simply rerun with the same command; it resumes.
-- Full run (thirty calls, about 25 minutes at high, longer above): never start it yourself. Give the user the exact
+- Full run (`--n 30`, thirty calls, about 25 minutes at high, longer above): never start it yourself. Give the user the exact
   command to run in their own terminal, then continue from its summary.
 
 ## 3. Judge
 
 1. `uv run python src/judge.py prepare --run RUN_ID` writes `data/runs/RUN_ID/judge/batch-NN.md`. It refuses an
-   incomplete run (finish the run first) and an already prepared one.
-2. For each batch file, read it and spawn one fresh `judge` agent with the Agent tool (`subagent_type: judge`). The
+   incomplete run (finish the run first). On a run already prepared, it batches only the cases not yet judged.
+2. For each batch file, read it and spawn one fresh `judge-direct` agent with the Agent tool (`subagent_type: judge-direct`). The
    prompt is exactly the file's text: no preamble, no instructions, no run id, model, effort or prompt version. One
    batch per judge; never resume, reuse or message a judge. The judge writes its own reply files; do not read, edit
    or write them.
@@ -86,7 +86,8 @@ also prints `delta kept` and one line per case with that case's change in kept %
 cleaner commit have no comparison row, so they print no delta and show `n/a`; that is correct. Read the negative
 cases as regressions and report them by count and size, not by case id or content.
 
-A quick row (ten cases) is descriptive only. A prompt is adopted only on a full-set row: if a quick row looks worth
+A quick row (first ten cases) is descriptive only, and a full row appears when more than ten are judged. A prompt is
+adopted only on a full row: if a quick row looks worth
 confirming, hand the user the full-run command (section 2).
 
 ## 5. Grids

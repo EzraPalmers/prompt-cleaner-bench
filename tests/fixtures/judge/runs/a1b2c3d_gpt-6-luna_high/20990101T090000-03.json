@@ -14,5 +14,6 @@
   "effort": "high",
   "codex_version": "0.162.1",
   "session_id": "fixture-session-2",
-  "started": "2099-01-01T09:00:00Z"
+  "started": "2099-01-01T09:00:00Z",
+  "dictionary": null
 }

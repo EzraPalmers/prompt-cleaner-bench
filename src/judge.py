@@ -3,18 +3,23 @@
 Usage:
   uv run python src/judge.py prepare --run RUN_ID [--method sentence|direct|chunked]
       Write blind batch files to data/runs/RUN_ID/judge/batch-NN.md and the item key to judge/key.json. The key
-      records the method, the set version, the judge model and version, and a hash of every item as prepared.
+      records the method, the judge model and version, and a hash of every item as prepared. Cases already in the
+      key are skipped, so preparing again after the run gained cases batches only the new ones (items and batch
+      files continue the numbering).
       The bench skill hands each batch file's text, and nothing else, to a fresh agent of the method: `judge`
       (sentence), `judge-direct` or `judge-chunked`.
   uv run python src/judge.py score --run RUN_ID [--method sentence|direct|chunked]
-      Refuse if the method differs from prepare's, or the set, the judge or any item's inputs changed since prepare.
+      Refuse if the method differs from prepare's, a judged case is not prepared, or the judge or any item's inputs
+      changed since prepare.
       Validate every reply. If any is missing or invalid, list them and write judge/retry-NN.md, one per fresh judge
-      (exit 1). Once all are valid, score the run into judge/summary.json (per case and per length band), replace
+      (exit 1). Once all are valid, score the run into judge/summary.json (per case and per length band; the top
+      level covers all judged cases, `quick` the first 10 of data/sets/cases.txt), replace
       the run's lines in the private <data>/scores.jsonl (one line per case), print the per-case kept deltas against
-      the comparison row when one exists, and regenerate outputs/results.md from every judged run.
+      the comparison row when one exists, and regenerate outputs/results.md from every judged run (a quick row
+      and, when the run has more cases, a full row).
 
 Flags:
-  --run RUN_ID  run folder name under <data>/runs/ (<prompt>_<model>_<effort>_<set>_<dictionary>)
+  --run RUN_ID  run folder name under <data>/runs/ (<prompt>_<model>_<effort>)
   --method M    judging method (default sentence): sentence answers every source and output sentence; direct
                 tallies only the faults of a dictation; chunked gives that tally per transcript part. A method other
                 than sentence prefixes the judge version, so its rows never compare with another method's.
@@ -37,7 +42,7 @@ from pathlib import Path
 
 from config import ROOT
 from extract import band
-from run import RECORD_FIELDS, RunError, load_set, sha256
+from run import DEFAULT_N, RECORD_FIELDS, RunError, load_cases, sha256
 
 DATA = ROOT / "data"
 RESULTS = ROOT / "outputs" / "results.md"
@@ -233,13 +238,14 @@ def write_text(path: Path, text: str) -> None:
 
 def parse_run_id(run_id: str) -> dict:
     parts = run_id.split("_")
-    if len(parts) != 5 or not all(parts):
-        raise JudgeError(f"run id must be <prompt>_<model>_<effort>_<set>_<dictionary>: {run_id}")
-    return dict(zip(("prompt", "model", "effort", "set", "dictionary"), parts))
+    if len(parts) != 3 or not all(parts):
+        raise JudgeError(f"run id must be <prompt>_<model>_<effort>: {run_id}")
+    return dict(zip(("prompt", "model", "effort"), parts))
 
 
 class Run:
-    """A run folder with its spec and per-case records; fails fast on anything incomplete or stale."""
+    """A run folder with its spec and the records of the cases of data/sets/cases.txt it holds; fails fast on
+    anything incomplete or mixed. fields["dictionary"] is the records' shared dictionary value, or "off"."""
 
     def __init__(self, data: Path, run_id: str):
         self.data = data
@@ -251,32 +257,27 @@ class Run:
         if not spec_path.is_file():
             raise JudgeError(f"no spec.json in {self.dir}")
         self.spec = read_json(spec_path)
-        for key in ("set_version", "harness"):
-            if key not in self.spec:
-                raise JudgeError(f"{spec_path}: missing key '{key}'")
+        if "harness" not in self.spec:
+            raise JudgeError(f"{spec_path}: missing key 'harness'")
         try:
-            cases, version = load_set(data, self.fields["set"])
+            cases = load_cases(data)
         except RunError as exc:
             raise JudgeError(str(exc)) from exc
-        if version != self.spec["set_version"]:
-            raise JudgeError(
-                f"set is now {version} but the run used {self.spec['set_version']}: transcripts or resolutions "
-                "changed since the run"
-            )
-        self.set_version = version
         self.inputs = {c.case_id: c for c in cases}
-        self.cases = list(self.inputs)
+        self.cases = [c for c in self.inputs if (self.dir / f"{c}.json").is_file()]
+        if not self.cases:
+            raise JudgeError(f"no case records in {self.dir}")
         self.records = self._load_records()
+        dictionaries = {r["dictionary"] for r in self.records.values()}
+        if len(dictionaries) > 1:
+            raise JudgeError(f"records in {self.dir} mix dictionary values {sorted(map(str, dictionaries))}")
+        self.fields["dictionary"] = dictionaries.pop() or "off"
 
     def _load_records(self) -> dict[str, dict]:
         records: dict[str, dict] = {}
         problems = []
         for case in self.cases:
-            path = self.dir / f"{case}.json"
-            if not path.is_file():
-                problems.append(f"{case}.json: missing")
-                continue
-            rec = read_json(path)
+            rec = read_json(self.dir / f"{case}.json")
             absent = [k for k in RECORD_FIELDS if k not in rec]
             if absent:
                 problems.append(f"{case}.json: missing fields {absent}")
@@ -383,9 +384,9 @@ def pack(items: list[tuple[int, str, int]]) -> list[list[tuple[int, str]]]:
     return [b for b in batches if b]
 
 
-def write_batches(folder: Path, stem: str, batches: list[list[tuple[int, str]]]) -> list[Path]:
+def write_batches(folder: Path, stem: str, batches: list[list[tuple[int, str]]], first: int = 1) -> list[Path]:
     paths = []
-    for number, batch in enumerate(batches, 1):
+    for number, batch in enumerate(batches, first):
         path = folder / f"{stem}-{number:02d}.md"
         write_text(path, batch_text([t for _, t in batch]))
         paths.append(path)
@@ -395,28 +396,40 @@ def write_batches(folder: Path, stem: str, batches: list[list[tuple[int, str]]])
 def prepare(run: Run, method: str = "sentence") -> list[Path]:
     key_path = run.judge_dir / "key.json"
     if key_path.exists():
-        raise JudgeError(f"already prepared: {run.judge_dir}; trash it and its reply folder to prepare again")
-    cases = [c for c in sorted(run.records) if run.records[c]["outcome"] in JUDGED]
+        key = read_json(key_path)
+        have = (key["method"], key["judge_model"], key["judge_version"])
+        now = (method, judge_model(method), judge_version(method))
+        if have != now:
+            raise JudgeError(
+                f"{run.judge_dir} was prepared with {' '.join(have)} but this is {' '.join(now)}; "
+                "trash it and its reply folder to prepare again"
+            )
+    else:
+        key = {
+            "token": secrets.token_hex(6),
+            "method": method,
+            "judge_model": judge_model(method),
+            "judge_version": judge_version(method),
+            "items": {},
+        }
+    prepared = {e["case"] for e in key["items"].values()}
+    cases = [c for c in sorted(run.records) if run.records[c]["outcome"] in JUDGED and c not in prepared]
+    if not cases:
+        raise JudgeError(f"nothing new to judge in {run.id}: every judged case is already in {key_path}")
     random.SystemRandom().shuffle(cases)
-    key = {
-        "token": secrets.token_hex(6),
-        "method": method,
-        "set_version": run.set_version,
-        "judge_model": judge_model(method),
-        "judge_version": judge_version(method),
-        "items": {},
-    }
+    last = max((int(n) for n in key["items"]), default=0)
+    first_batch = max((e["batch"] for e in key["items"].values()), default=0) + 1
     items = []
-    for n, case in enumerate(cases, 1):
+    for n, case in enumerate(cases, last + 1):
         text, reply_tokens, _ = item(run, key, n, case)
         items.append((n, text, reply_tokens))
         key["items"][str(n)] = {"case": case, "sha256": sha256(text.encode("utf-8"))}
     batches = pack(items)
-    for number, batch in enumerate(batches, 1):
+    for number, batch in enumerate(batches, first_batch):
         for n, _ in batch:
             key["items"][str(n)]["batch"] = number
     reply_dir(run, key).mkdir(parents=True, exist_ok=True)
-    paths = write_batches(run.judge_dir, "batch", batches)
+    paths = write_batches(run.judge_dir, "batch", batches, first_batch)
     for path, batch in zip(paths, batches):
         print(f"{path.name}  {len(batch)} items")
     write_text(key_path, json.dumps(key, indent=2) + "\n")
@@ -752,7 +765,7 @@ def paired_delta(
 ) -> tuple[float | None, float | None, dict]:
     """Mean per-case difference current - previous over cases defined in both, its SE, and the per-case deltas."""
     if set(current) != set(previous):
-        raise JudgeError("paired runs cover different cases despite the same set version")
+        raise JudgeError("paired runs cover different cases")
     deltas = {}
     for c in sorted(current):
         a, b = current[c], previous[c]
@@ -776,8 +789,8 @@ def call_cost(record: dict, model: str) -> float | None:
     return (fresh * price_in + cached * price_cached + written * price_write + out * price_out) / 1e6
 
 
-def call_stats(run: Run) -> dict:
-    recs = list(run.records.values())
+def call_stats(run: Run, cases: list[str]) -> dict:
+    recs = [run.records[c] for c in cases]
 
     def tokens(r: dict) -> int | None:
         if r.get("input_tokens") is None or r.get("output_tokens") is None:
@@ -854,15 +867,33 @@ def write_scores(path: Path, run_id: str, rows: list[dict]) -> None:
     write_text(path, "".join(f"{ln}\n" for ln in kept + [json.dumps(r) for r in rows]))
 
 
+def view(run: Run, per_case: dict[str, dict], words: dict[str, int], cases: list[str]) -> dict:
+    """Aggregates over the scored cases among `cases`."""
+    chosen = {c: per_case[c] for c in cases if c in per_case}
+    bands: dict[str, dict] = {}
+    for case, values in chosen.items():
+        bands.setdefault(band(words[case]) or "outside bands", {})[case] = values
+    return {
+        "n_cases": len(chosen),
+        "metrics": aggregate(chosen),
+        "calls": call_stats(run, list(chosen)),
+        "bands": {b: {"n": len(v), "metrics": aggregate(v)} for b, v in sorted(bands.items())},
+        "per_case": chosen,
+    }
+
+
 def score(run: Run, previous: Previous, method: str = "sentence") -> dict:
     """Score the run into judge/summary.json and print the per-case kept deltas when a comparison row exists."""
     words = {c: len(run.transcript(c).split()) for c in run.cases}
     key = read_json(run.judge_dir / "key.json")
     if key.get("method") != method:
         raise JudgeError(f"prepared with --method {key.get('method')}; score with the same method, or prepare again")
+    unprepared = [
+        c for c in run.cases if run.records[c]["outcome"] in JUDGED and c not in {e["case"] for e in key["items"].values()}
+    ]
+    if unprepared:
+        raise JudgeError(f"{len(unprepared)} judged case(s) have no verdict yet; run prepare again to batch them")
     stale = []
-    if key["set_version"] != run.set_version:
-        stale.append(f"set {key['set_version']} -> {run.set_version}")
     current_judge = (judge_model(method), judge_version(method))
     if (key["judge_model"], key["judge_version"]) != current_judge:
         stale.append(f"judge {key['judge_model']} {key['judge_version']} -> {' '.join(current_judge)}")
@@ -896,22 +927,15 @@ def score(run: Run, previous: Previous, method: str = "sentence") -> dict:
             n_source = len(split_sentences(run.transcript(case)))
             tally = reply_tally(method, replies[case], n_source, run.records[case]["output"])
         per_case[case], counts[case] = case_metrics(run.records[case], tally, words[case])
-    bands: dict[str, dict] = {}
-    for case, values in per_case.items():
-        label = band(words[case]) or "outside bands"
-        bands.setdefault(label, {})[case] = values
+    quick = list(run.inputs)[:DEFAULT_N]
     summary = {
         "run_id": run.id,
         **run.fields,
-        "set_version": run.set_version,
         "harness": run.spec["harness"],
         "judge_model": key["judge_model"],
         "judge_version": key["judge_version"],
-        "n_cases": len(run.cases),
-        "metrics": aggregate(per_case),
-        "calls": call_stats(run),
-        "bands": {b: {"n": len(v), "metrics": aggregate(v)} for b, v in sorted(bands.items())},
-        "per_case": per_case,
+        **view(run, per_case, words, run.cases),
+        "quick": view(run, per_case, words, quick),
     }
     write_text(run.judge_dir / "summary.json", json.dumps(summary, indent=2) + "\n")
     rows = [
@@ -950,16 +974,19 @@ def load_summaries(runs: Path) -> list[dict]:
     return summaries
 
 
-def find_delta(s: dict, summaries: list[dict], previous: Previous) -> tuple[str, dict] | None:
-    """Comparison row for s: the previous AGENTS.md change at the same cell, set version and judge version."""
+def find_delta(s: dict, summaries: list[dict], previous: Previous, rows: str = "full") -> tuple[str, dict] | None:
+    """Comparison row for s: the previous AGENTS.md change at the same cell and judge version, paired over the cases
+    both runs scored in the rows ("quick" or "full")."""
     target = previous(s["prompt"])
     if target is None:
         return None
-    cell = ("model", "effort", "dictionary", "set_version", "judge_version")
+    cell = ("model", "effort", "dictionary", "judge_version")
     for p in summaries:
         if p["prompt"] == target and all(p[k] == s[k] for k in cell):
-            current = {c: v["kept"] for c, v in s["per_case"].items()}
-            prior = {c: v["kept"] for c, v in p["per_case"].items()}
+            cur, old = (s, p) if rows == "full" else (s[rows], p[rows])
+            common = cur["per_case"].keys() & old["per_case"].keys()
+            current = {c: cur["per_case"][c]["kept"] for c in common}
+            prior = {c: old["per_case"][c]["kept"] for c in common}
             m, se, deltas = paired_delta(current, prior)
             return f"{fmt(m, 1, se)} vs {p['prompt']}", deltas
     return None
@@ -977,12 +1004,13 @@ DIGITS = {
 }  # fmt: skip
 
 
-def table_row(s: dict, delta: str) -> list[str]:
-    m = {k: fmt(v[0], DIGITS[k]) for k, v in s["metrics"].items()}
-    kept, kept_se = s["metrics"]["kept"]
-    c = s["calls"]
+def table_row(s: dict, rows: str, delta: str) -> list[str]:
+    v = s if rows == "full" else s["quick"]
+    m = {k: fmt(x[0], DIGITS[k]) for k, x in v["metrics"].items()}
+    kept, kept_se = v["metrics"]["kept"]
+    c = v["calls"]
     return [
-        s["prompt"], s["model"], s["effort"], s["dictionary"], s["set_version"], str(s["n_cases"]),
+        s["prompt"], s["model"], s["effort"], s["dictionary"], rows, str(v["n_cases"]),
         fmt(kept, 1, kept_se), m["critical"], m["omissions"], m["distortions"], m["additions"], m["fillers"],
         m["critical_free"], delta, m["flags"], m["wrong_fixes"], m["missed_fixes"], m["incomplete"],
         fmt(c["tokens"], 0), fmt(c["cost"], 4), fmt(c["seconds"], 1),
@@ -991,22 +1019,30 @@ def table_row(s: dict, delta: str) -> list[str]:
 
 
 def render_table(summaries: list[dict], previous: Previous) -> str:
-    keys = [(s["prompt"], s["model"], s["effort"], s["dictionary"], s["set_version"], s["judge_version"]) for s in summaries]
+    keys = [(s["prompt"], s["model"], s["effort"], s["dictionary"], s["judge_version"]) for s in summaries]
     dupes = {k for k in keys if keys.count(k) > 1}
     if dupes:
         raise JudgeError(f"two judged runs share a results row: {sorted(dupes)}")
-    order = sorted(summaries, key=lambda s: (s["set_version"], s["model"], s["effort"], s["dictionary"], s["prompt"]))
+    cells = []
+    for s in summaries:
+        if s["quick"]["n_cases"]:
+            cells.append((s, "quick"))
+        if s["n_cases"] > s["quick"]["n_cases"]:
+            cells.append((s, "full"))
+    cells.sort(key=lambda c: (c[1] != "quick", c[0]["model"], c[0]["effort"], c[0]["dictionary"], c[0]["prompt"]))
     rows = []
-    for s in order:
-        found = find_delta(s, summaries, previous)
-        rows.append(table_row(s, found[0] if found else "n/a"))
+    for s, which in cells:
+        found = find_delta(s, summaries, previous, which)
+        rows.append(table_row(s, which, found[0] if found else "n/a"))
     lines = [
         "# Results",
         "",
         "Generated by `uv run python src/judge.py score`; do not edit by hand. One row per prompt, model, effort,",
-        "dictionary, set version and judge version. Values are per-case means, kept % with its standard error in",
-        "brackets. Critical faults are omissions, distortions and additions per 100 content sentences. Rows are",
-        "comparable only at the same set version and judge version. Cost is list price, a comparison measure.",
+        "dictionary, case rows and judge version. The quick row is the first 10 cases of data/sets/cases.txt, the",
+        "full row every judged case (shown when the run has more than 10). Values are per-case means, kept % with its",
+        "standard error in brackets. Critical faults are omissions, distortions and additions per 100 content",
+        "sentences. Rows are comparable only at the same case rows and judge version. Cost is list price, a comparison",
+        "measure.",
         "",
         "| " + " | ".join(COLUMNS) + " |",
         "|" + "|".join("---" for _ in COLUMNS) + "|",

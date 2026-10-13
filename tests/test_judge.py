@@ -8,7 +8,7 @@ import judge
 from judge import JudgeError, Run, filler_count, paired_delta, regex_fillers, split_sentences, validate
 
 FIXTURE = Path(__file__).parent / "fixtures" / "judge"
-RUN_ID = "a1b2c3d_gpt-6-luna_high_quick_off"
+RUN_ID = "a1b2c3d_gpt-6-luna_high"
 CASES = [f"20990101T090000-0{i}" for i in range(1, 5)]
 NONE = lambda prompt: None
 
@@ -126,11 +126,59 @@ def test_batch_is_blind_and_bounded(data, method):
     run = Run(data, RUN_ID)
     paths = judge.prepare(run, method)
     text = "".join(p.read_text(encoding="utf-8") for p in paths)
-    for leak in ("gpt-6-luna", "high", "a1b2c3d", "quick", "2f95c0", "off", "2099", RUN_ID, "dictionary"):
+    for leak in ("gpt-6-luna", "high", "a1b2c3d", "off", "2099", RUN_ID, "dictionary"):
         assert leak not in text.replace(str(data), "")
     assert text.count("## Item") == 4
-    with pytest.raises(JudgeError, match="already prepared"):
+    with pytest.raises(JudgeError, match="nothing new to judge"):
+        judge.prepare(run, method)
+
+
+def test_prepare_again_batches_only_cases_without_a_verdict(data, monkeypatch):
+    monkeypatch.setattr(judge, "MAX_ITEMS", 2)
+    cases = data / "sets" / "cases.txt"
+    cases.write_text("\n".join(CASES[:2]) + "\n", encoding="utf-8")
+    run = Run(data, RUN_ID)
+    assert run.cases == CASES[:2]
+    assert [p.name for p in judge.prepare(run)] == ["batch-01.md"]
+    answer_all(run)
+    with pytest.raises(JudgeError, match="nothing new"):
         judge.prepare(run)
+    cases.write_text("\n".join(CASES) + "\n", encoding="utf-8")
+    run = Run(data, RUN_ID)
+    paths = judge.prepare(run)
+    assert [p.name for p in paths] == ["batch-02.md"]
+    assert paths[0].read_text(encoding="utf-8").count("## Item") == 2
+    key = json.loads((run.judge_dir / "key.json").read_text())
+    assert sorted(key["items"], key=int) == ["1", "2", "3", "4"]
+    assert sorted(e["case"] for e in key["items"].values()) == CASES
+    assert [key["items"][n]["batch"] for n in "1234"] == [1, 1, 2, 2]
+    answer_all(run)
+    assert judge.score(run, NONE)["n_cases"] == 4
+
+
+def test_score_refuses_judged_cases_without_a_verdict(data):
+    cases = data / "sets" / "cases.txt"
+    cases.write_text("\n".join(CASES[:2]) + "\n", encoding="utf-8")
+    run = Run(data, RUN_ID)
+    judge.prepare(run)
+    cases.write_text("\n".join(CASES) + "\n", encoding="utf-8")
+    with pytest.raises(JudgeError, match="2 judged case.*prepare again"):
+        judge.score(Run(data, RUN_ID), NONE)
+
+
+def test_quick_row_is_the_first_cases_of_the_list_and_full_row_all(data, monkeypatch):
+    monkeypatch.setattr(judge, "DEFAULT_N", 2)
+    run = Run(data, RUN_ID)
+    judge.prepare(run)
+    answer_all(run, lambda case, r: r["source"][0].update(present="no", missing=["a clause"]) or r
+               if case == CASES[3] else r)
+    summary = judge.score(run, NONE)
+    assert summary["n_cases"] == 4 and summary["quick"]["n_cases"] == 2
+    assert set(summary["quick"]["per_case"]) == set(CASES[:2])
+    assert summary["quick"]["metrics"]["kept"][0] == 100.0 and summary["metrics"]["kept"][0] < 100.0
+    judge.regenerate(data, NONE)
+    rows = [ln.split(" | ") for ln in judge.RESULTS.read_text(encoding="utf-8").splitlines() if ln.startswith("| a1")]
+    assert [(r[4], r[5]) for r in rows] == [("quick", "2"), ("full", "4")]
 
 
 def test_batches_split_at_item_limit(data, monkeypatch):
@@ -144,16 +192,25 @@ def test_item_over_token_ceiling_is_refused(data, monkeypatch):
         judge.prepare(Run(data, RUN_ID))
 
 
-def test_missing_failed_record_blocks_the_run(data):
+def test_cases_without_a_record_are_left_out_and_a_failed_record_blocks_the_run(data):
     run_dir = data / "runs" / RUN_ID
     (run_dir / f"{CASES[3]}.json").unlink()
-    with pytest.raises(JudgeError, match=f"{CASES[3]}.json: missing"):
-        Run(data, RUN_ID)
+    assert Run(data, RUN_ID).cases == CASES[:3]
     record = json.loads((run_dir / f"{CASES[2]}.json").read_text())
     record["outcome"] = "failed"
     (run_dir / f"{CASES[3]}.json").write_text(json.dumps(record))
     with pytest.raises(JudgeError, match="outcome failed"):
         Run(data, RUN_ID)
+
+
+def test_dictionary_comes_from_the_records_and_mixing_is_refused(data):
+    assert Run(data, RUN_ID).fields["dictionary"] == "off"
+    edit_record(data, CASES[0], dictionary="2f95c0")
+    with pytest.raises(JudgeError, match="mix dictionary"):
+        Run(data, RUN_ID)
+    for case in CASES[1:]:
+        edit_record(data, case, dictionary="2f95c0")
+    assert Run(data, RUN_ID).fields["dictionary"] == "2f95c0"
 
 
 def test_record_without_required_fields_blocks_the_run(data):
@@ -162,12 +219,6 @@ def test_record_without_required_fields_blocks_the_run(data):
     del record["output"]
     path.write_text(json.dumps(record))
     with pytest.raises(JudgeError, match="missing fields"):
-        Run(data, RUN_ID)
-
-
-def test_set_changed_since_the_run_is_refused(data):
-    (data / "cases" / CASES[0] / "transcript.txt").write_text("Paint it blue.", encoding="utf-8")
-    with pytest.raises(JudgeError, match="set is now"):
         Run(data, RUN_ID)
 
 
@@ -259,7 +310,7 @@ def test_scores_file_has_one_line_per_case_replaced_on_rerun(data):
     assert [ln["run_id"] for ln in lines] == ["other-run"] + [RUN_ID] * 4
     row = lines[1]
     assert row == {
-        "run_id": RUN_ID, "prompt": "a1b2c3d", "model": "gpt-6-luna", "effort": "high", "set": "quick",
+        "run_id": RUN_ID, "prompt": "a1b2c3d", "model": "gpt-6-luna", "effort": "high",
         "dictionary": "off", "case_id": row["case_id"], "method": "sentence", "outcome": row["outcome"],
         "kept": row["kept"], "omissions": 1, "distortions": 0, "additions": 0, "fillers": row["fillers"],
         "critical": 1, "content": 8, "judge_content": None,
@@ -275,7 +326,7 @@ def test_score_prints_per_case_deltas_against_the_comparison_row(data, capsys):
     assert "delta kept" not in capsys.readouterr().out
     prior = json.loads(json.dumps(summary)) | {"prompt": "0000000"}
     prior["per_case"][CASES[0]]["kept"] = 75.0
-    prior_dir = data / "runs" / "0000000_gpt-6-luna_high_quick_off" / "judge"
+    prior_dir = data / "runs" / "0000000_gpt-6-luna_high" / "judge"
     prior_dir.mkdir(parents=True)
     (prior_dir / "summary.json").write_text(json.dumps(prior), encoding="utf-8")
     judge.score(run, {"a1b2c3d": "0000000"}.get)
@@ -307,7 +358,7 @@ def test_previous_change_is_relative_to_the_row_commit():
 
 def test_delta_finds_previous_prompt_at_same_cell():
     def summary(prompt, kept, **over):
-        s = {"prompt": prompt, "model": "m", "effort": "high", "dictionary": "off", "set_version": "quick@1",
+        s = {"prompt": prompt, "model": "m", "effort": "high", "dictionary": "off",
              "judge_version": "j1", "per_case": {"a": {"kept": kept[0]}, "b": {"kept": kept[1]}}}
         return s | over  # fmt: skip
 
