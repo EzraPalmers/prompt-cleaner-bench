@@ -10,8 +10,8 @@ import pytest
 import run as runner
 from run import (
     COUNTS,
-    NONE_NEEDED,
     RECORD_FIELDS,
+    SKIP,
     RunError,
     answer,
     fenced,
@@ -116,8 +116,8 @@ def test_phrase_matching():
     assert items == [(1, ["pie shard"]), (2, ["blue moose"])]
     assert answer(items, RESOLUTION) == ("1. pie chart", ["blue moose"])
     assert answer(items, {**RESOLUTION, "accepted": ["Blue moose."]}) == ("1. pie chart", [])
-    assert answer([(1, ["blue moose"])], RESOLUTION) == (NONE_NEEDED, ["blue moose"])
-    assert answer([(1, ["blue moose"])], None) == (NONE_NEEDED, ["blue moose"])
+    assert answer([(1, ["blue moose"])], RESOLUTION) == (SKIP, ["blue moose"])
+    assert answer([(1, ["blue moose"])], None) == (SKIP, ["blue moose"])
     assert parse_list(CLEAN) is None
 
 
@@ -221,17 +221,20 @@ def test_fourth_list_is_other_and_counts_its_phrases(root, tmp_path, monkeypatch
     assert record["outcome"] == "other" and len(record["replies"]) == 3 and record["unmatched"] == ["blue moose"]
 
 
-def test_list_with_prose_is_other_and_not_answered(root, tmp_path, monkeypatch):
-    prose = ("Suspect transcription issues:\n\n1. We went to the market. [Wait: wrong sentence?] Need the exact one: "
-             '"Then the blue moose left." I guess bold only moose.\nMaybe no issue at all? Let\'s list it.')  # fmt: skip
-    assert parse_list(prose) is None
-    assert parse_list(LIST + "\nI think that covers it.") is None
+def test_loose_list_is_parsed_and_unmatched_items_are_skipped(root, tmp_path, monkeypatch):
+    loose = "Suspect transcription issues:\n\n1. We went to the market.\nIs that right?\n\n2. Then the **blue moose** left."
+    assert parse_list(loose) == [(1, ["We went to the market."]), (2, ["blue moose"])]
+    assert parse_list(LIST + "\nI think that covers it.") == parse_list(LIST)
+    unbolded = "Suspect transcription issues:\n\n1. We sat by the pie shard today."
+    assert answer(parse_list(unbolded) or [], RESOLUTION) == ("1. pie chart", [])
     (root / "data" / "sets" / "cases.txt").write_text("c-list\n")
-    state, codex = fake(tmp_path, monkeypatch, [{"events": turn(prose, usage(10))}])
+    script = [{"events": turn(loose, usage(10))}, {"events": turn(CLEAN, usage(20))[1:]}]
+    state, codex = fake(tmp_path, monkeypatch, script)
     assert run(args(n=1), root, codex) == 0
     record = json.loads(next((root / "data" / "runs").glob("*/c-list.json")).read_text())
-    assert record["outcome"] == "other" and record["unmatched"] == [] and record["replies"] == []
-    assert json.loads(state.read_text())["done"] == 1
+    assert record["outcome"] == "suspect-then-clean" and record["replies"] == [SKIP]
+    assert record["unmatched"] == ["We went to the market.", "blue moose"]
+    assert json.loads(state.read_text())["stdin"][1] == SKIP
 
 
 def test_final_fenced_block():

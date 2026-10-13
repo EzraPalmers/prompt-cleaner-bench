@@ -43,7 +43,7 @@ RECORD_FIELDS = (
 DEFAULT_N = 10
 DICT_CHARS = 6
 LIST_HEAD = "Suspect transcription issues:"
-NONE_NEEDED = "None of these need correcting."
+SKIP = "skip"
 MAX_LISTS = 3
 SLUG = re.compile(r"[\w.-]+")
 ITEM = re.compile(r"\s*(\d+)[.)]\s+(.*)")
@@ -173,21 +173,17 @@ def matches(phrase: str, heard: str) -> bool:
 
 
 def parse_list(reply: str) -> list[tuple[int, list[str]]] | None:
-    """Numbered items of a suspect list with their bold phrases; None unless every non-blank line after the heading is
-    a numbered item with a bold phrase, as the prompt's format has it."""
+    """Numbered items of a reply starting with the suspect heading, None otherwise. An item's phrases are its bold
+    phrases, or its whole text when it has none; unnumbered lines are ignored."""
     text = reply.strip()
     if not text.startswith(LIST_HEAD):
         return None
     items: list[tuple[int, list[str]]] = []
     for line in text[len(LIST_HEAD) :].splitlines():
-        if not line.strip():
-            continue
         m = ITEM.fullmatch(line)
-        phrases = BOLD.findall(m[2]) if m else []
-        if m is None or not phrases:
-            return None
-        items.append((int(m[1]), phrases))
-    return items or None
+        if m:
+            items.append((int(m[1]), BOLD.findall(m[2]) or [m[2].strip()]))
+    return items
 
 
 def answer(items: list[tuple[int, list[str]]], resolution: dict | None) -> tuple[str, list[str]]:
@@ -204,7 +200,7 @@ def answer(items: list[tuple[int, list[str]]], resolution: dict | None) -> tuple
                 unmatched.append(phrase)
         if meant:
             lines.append(f"{n}. {'; '.join(meant)}")
-    return ("\n".join(lines) if lines else NONE_NEEDED), unmatched
+    return ("\n".join(lines) if lines else SKIP), unmatched
 
 
 def fenced(reply: str) -> str | None:
