@@ -180,6 +180,21 @@ def test_dictionary_hash_is_recorded_and_a_larger_n_runs_only_new_cases(root, tm
         run(args(n=3), root, codex)
 
 
+def test_harness_difference_is_accepted_and_other_spec_changes_refused(root, tmp_path, monkeypatch):
+    _, codex = fake(tmp_path, monkeypatch, [{"events": turn(CLEAN, usage(5))}, {"events": turn(CLEAN, usage(6))}])
+    monkeypatch.setattr(runner, "harness", lambda _root: "aaaaaaa")
+    assert run(args(n=1), root, codex) == 0
+    spec_path = next((root / "data" / "runs").iterdir()) / "spec.json"
+    assert json.loads(spec_path.read_text())["harness"] == "aaaaaaa"
+    monkeypatch.setattr(runner, "harness", lambda _root: "bbbbbbb")
+    assert run(args(n=2), root, codex) == 0
+    assert json.loads(spec_path.read_text())["harness"] == "bbbbbbb"
+    spec = json.loads(spec_path.read_text())
+    spec_path.write_text(json.dumps({**spec, "codex_version": "0.0.1"}))
+    with pytest.raises(RunError, match=r"spec differs.*codex_version"):
+        run(args(n=2), root, codex)
+
+
 def test_failed_call_is_rerun(root, tmp_path, monkeypatch):
     (root / "data" / "sets" / "cases.txt").write_text("c-clean\n")
     _, codex = fake(tmp_path, monkeypatch, [{"events": [], "exit": 3}, {"events": turn(CLEAN, usage(5))}])

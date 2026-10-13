@@ -14,7 +14,7 @@ One call per case. Writes the call cwd data/stage/<run_id>/ and data/runs/<run_i
 <case_id>.json per case. The run_id is <prompt label>_<model>_<effort>; each record's `dictionary` is the first six hex
 characters of the dictionary file's sha256 when --dictionary was on, else null.
 A rerun skips complete records (failed ones run again), so a larger --n runs only the new cases. It refuses when
-spec.json differs, naming the fields, or when a record in the folder has a different dictionary value.
+spec.json differs in any field but `harness` (provenance, updated whenever records are added), naming the fields, or when a record in the folder has a different dictionary value.
 Exit 0 when every call has a record that is not failed; 1 otherwise or on an input error.
 """
 
@@ -372,7 +372,8 @@ def check_spec(path: Path, spec: dict) -> None:
     if not path.is_file():
         return
     old = json.loads(path.read_text(encoding="utf-8"))
-    diff = [f"{k} ({old.get(k)!r} -> {spec.get(k)!r})" for k in sorted(old.keys() | spec.keys()) if old.get(k) != spec.get(k)]
+    keys = sorted((old.keys() | spec.keys()) - {"harness"})
+    diff = [f"{k} ({old.get(k)!r} -> {spec.get(k)!r})" for k in keys if old.get(k) != spec.get(k)]
     if diff:
         raise RunError(
             f"spec differs from {path}: {', '.join(diff)}; move {path.parent} to the trash before rerunning"
@@ -433,9 +434,8 @@ def run(args: argparse.Namespace, root: Path, codex: list[str]) -> int:
     print(f"{run_id}: {len(cases)} cases, {len(cases) - len(todo)} done, {len(todo)} to run")
     for case in todo:
         print(f"{case.case_id} ({case.words if case.words is not None else '?'} words) ...", end="", flush=True)
-        if not (run_dir / "spec.json").is_file():
-            run_dir.mkdir(parents=True, exist_ok=True)
-            write_json(run_dir / "spec.json", spec)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        write_json(run_dir / "spec.json", spec)
         record = run_call(case, codex, stage, prompt, args, version) | {"dictionary": dict_id}
         write_json(run_dir / f"{case.case_id}.json", record)
         print(f" {record['outcome']} {record['seconds']:.1f} s")
